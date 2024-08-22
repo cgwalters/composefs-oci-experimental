@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Seek, Write};
 use std::ops::Add;
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -24,7 +25,7 @@ use rustix::fd::BorrowedFd;
 use rustix::fs::AtFlags;
 use serde::{Deserialize, Serialize};
 
-use crate::fileutils;
+use crate::fileutils::{self, default_dirbuilder};
 use crate::sha256descriptor::{DescriptorExt, Sha256Hex};
 
 /// Standardized metadata
@@ -41,14 +42,15 @@ const TAGS: &str = "tags";
 const DESCRIPTOR: &str = "descriptor";
 /// A subdirectory of images/
 const LAYERS: &str = "layers";
-/// Generic OCI artifacts (may be container images)
+/// Generic OCI artifacts (may be container images, or may not be)
+/// /artifacts
+///   /tags/<urlencoded>
+///   /descriptor/<sha256>
 const ARTIFACTS: &str = "artifacts";
 const TMP: &str = "tmp";
-/// The extended attribute attached to an object with its MIME type.
-/// We choose to reuse the type defined by https://0pointer.net/blog/projects/mod-mime-xattr.html
-const MIMETYPE_XATTR: &str = "user.mime-type";
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &'static str = "../../";
+const DESCRIPTOR_UPLINK: &'static str = "../../objects/";
 const TAG_UPLINK: &'static str = "../../objects/";
 
 /// Can be included in a manifest if the digest is pre-computed
@@ -69,6 +71,22 @@ fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> Obje
     objid.insert(2, '/');
     objid.insert_str(0, prefix);
     objid.into()
+}
+
+#[context("Parsing object link")]
+fn object_link_to_digest(buf: std::path::PathBuf) -> Result<ObjectDigest> {
+    // It's an error if we find non-UTF8 content here
+    let mut buf = buf
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
+    while buf.starts_with("../") {
+        buf.replace_range(0..3, "");
+    }
+    // Trim the `/`
+    buf.replace_range(2..3, "");
+    let _ = Sha256Hex::new(buf.as_str());
+    Ok(buf)
 }
 
 /// The extended attribute we attach with the target metadata
@@ -552,24 +570,25 @@ impl RepoTransaction {
         &self,
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
-    ) -> Result<ObjectDigest> {
-        let descriptor_sha256 = descriptor.sha256()?;
+    ) -> Result<ObjectPath> {
         let tmpf = tmpf.finish_validate(&descriptor)?;
         let objid = self.import_object(tmpf)?;
-        let mut uplink_path = objid.clone();
-        uplink_path.insert_str(0, BY_SHA256_UPLINK);
-        let mut by_sha256_path = String::from(OBJECTS_BY_SHA256);
-        append_object_path(&mut by_sha256_path, &descriptor_sha256)?;
+        let (parent, digest) = path_components_for_descriptor(descriptor)?;
+        let basepath = format!("{ARTIFACTS}/{DESCRIPTOR}/{parent}");
+        self.repo
+            .0
+            .dir
+            .ensure_dir_with(&basepath, &default_dirbuilder())
+            .with_context(|| format!("Creating descriptor dir {basepath}"))?;
+        let objpath = object_digest_to_path_prefixed(objid, &DESCRIPTOR_UPLINK);
+        let target_path = format!("{basepath}/{digest}");
         ignore_rustix_eexist(rustix::fs::symlinkat(
-            &uplink_path,
+            objpath.as_std_path(),
             &self.repo.0.dir,
-            &by_sha256_path,
+            &target_path,
         ))?;
-        tracing::debug!(
-            "Added descriptor {} to {by_sha256_path}",
-            descriptor.digest()
-        );
-        Ok(objid)
+        tracing::debug!("Added descriptor {target_path}",);
+        Ok(objpath)
     }
 
     fn add_tag(&self, objid: ObjectDigest, tagpath: &Utf8Path) -> Result<()> {
@@ -692,14 +711,18 @@ fn cfs_entry_for_descriptor(
     Ok(e)
 }
 
-fn path_for_descriptor(descriptor: &Descriptor) -> Result<Utf8PathBuf> {
+fn path_components_for_descriptor(descriptor: &Descriptor) -> Result<(String, Sha256Hex)> {
     // TODO https://github.com/containers/oci-spec-rs/pull/200
     let media_type = descriptor.media_type().to_string();
     let mtype =
         percent_encoding::percent_encode(media_type.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
     let sha256 = descriptor.sha256()?;
-    let r = format!("{mtype}/{sha256}");
-    Ok(r.into())
+    Ok((mtype.to_string(), sha256))
+}
+
+fn path_for_descriptor(descriptor: &Descriptor) -> Result<Utf8PathBuf> {
+    let (parent, sha256) = path_components_for_descriptor(descriptor)?;
+    Ok(format!("{parent}/{sha256}").into())
 }
 
 #[derive(Debug)]
@@ -831,7 +854,7 @@ impl Repo {
 
     fn lookup_descriptor(&self, descriptor: &Descriptor) -> Result<Option<ObjectDigest>> {
         let path = path_for_descriptor(descriptor)?;
-        let buf = match rustix::fs::readlinkat(&self.0.dir, &by_sha256_path, Vec::new()) {
+        let buf = match rustix::fs::readlinkat(&self.0.dir, path.as_std_path(), Vec::new()) {
             Ok(r) => r,
             Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
             Err(e) => return Err(e.into()),
