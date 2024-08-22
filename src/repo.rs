@@ -1,7 +1,7 @@
 use std::collections::hash_map::VacantEntry;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Seek, Write};
+use std::io::{self, BufReader, Seek, Write};
 use std::ops::Add;
 use std::os::fd::AsFd;
 use std::path::Path;
@@ -37,8 +37,8 @@ const OBJECTS_BY_SHA256: &str = "objects/by-sha256";
 const IMAGES: &str = "images";
 /// A subdirectory of images/ or artifacts/, hardlink farm
 const TAGS: &str = "tags";
-/// Object hardlink farm, by manifest sha256 digest
-const BY_MANIFEST: &str = "by-manifest-digest";
+/// /descriptor/<url encoded MIME type>/<object id>
+const DESCRIPTOR: &str = "descriptor";
 /// A subdirectory of images/
 const LAYERS: &str = "layers";
 /// Generic OCI artifacts (may be container images)
@@ -692,6 +692,16 @@ fn cfs_entry_for_descriptor(
     Ok(e)
 }
 
+fn path_for_descriptor(descriptor: &Descriptor) -> Result<Utf8PathBuf> {
+    // TODO https://github.com/containers/oci-spec-rs/pull/200
+    let media_type = descriptor.media_type().to_string();
+    let mtype =
+        percent_encoding::percent_encode(media_type.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
+    let sha256 = descriptor.sha256()?;
+    let r = format!("{mtype}/{sha256}");
+    Ok(r.into())
+}
+
 #[derive(Debug)]
 struct RepoInner {
     dir: Dir,
@@ -735,8 +745,8 @@ impl Repo {
             dir.ensure_dir_with(name, dirbuilder).context(name)?;
             dir.ensure_dir_with(format!("{name}/{TAGS}"), dirbuilder)
                 .context(TAGS)?;
-            dir.ensure_dir_with(format!("{name}/{BY_MANIFEST}"), dirbuilder)
-                .context(BY_MANIFEST)?;
+            dir.ensure_dir_with(format!("{name}/{DESCRIPTOR}"), dirbuilder)
+                .context(DESCRIPTOR)?;
         }
         // A special subdir for images/
         dir.ensure_dir_with(format!("{IMAGES}/{LAYERS}"), dirbuilder)
@@ -820,17 +830,31 @@ impl Repo {
     }
 
     fn lookup_descriptor(&self, descriptor: &Descriptor) -> Result<Option<ObjectDigest>> {
-        self.descriptor_digest_to_objid(descriptor.sha256()?)
+        let path = path_for_descriptor(descriptor)?;
+        let buf = match rustix::fs::readlinkat(&self.0.dir, &by_sha256_path, Vec::new()) {
+            Ok(r) => r,
+            Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut buf = buf.into_string()?;
+        if !(buf.chars().all(|c| c.is_ascii())
+            && buf.starts_with(BY_SHA256_UPLINK)
+            && buf.bytes().nth(2) == Some(b'/'))
+        {
+            anyhow::bail!("Invalid descriptor symlink: {buf}");
+        }
+        buf.replace_range(0..BY_SHA256_UPLINK.len(), "");
+        buf.remove(2);
+        // Verify
+        let _ = Sha256Hex::new(&buf);
+        Ok(Some(buf))
     }
 
-    #[context("Reading descriptor sha256:{digest}")]
-    fn read_descriptor_verified(&self, digest: Sha256Hex) -> Result<Option<Descriptor>> {
-        let Some(objid) = self.descriptor_digest_to_objid(digest)? else { 
-            return Ok(None);
-        };
-        let objpath = object_digest_to_path(objid);
-        let descriptor = Descriptor::new(todo!(), size, digest.to_descriptor_digest());
-        Ok(descriptor)
+    #[context("Reading descriptor sha256:{}", descriptor.digest())]
+    fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Option<File>> {
+        let path = path_for_descriptor(descriptor)?;
+        let f = self.0.dir.open_optional(&path)?;
+        Ok(f.map(|f| f.into_std()))
     }
 
     #[context("Reading tag {:?}", tag)]
@@ -873,14 +897,14 @@ impl Repo {
 
     /// Returns true if this manifest digest is stored as an image
     pub fn has_image_manifest(&self, descriptor: &Descriptor) -> Result<bool> {
-        let mut path = format!("{IMAGES}/{BY_MANIFEST}");
+        let mut path = format!("{IMAGES}/{DESCRIPTOR}");
         append_object_path(&mut path, &descriptor.sha256()?)?;
         self.0.dir.try_exists(path).map_err(Into::into)
     }
 
     /// Returns true if this manifest digest is stored as an artifact
     pub fn has_artifact_manifest(&self, descriptor: &Descriptor) -> Result<bool> {
-        let mut path = format!("{ARTIFACTS}/{BY_MANIFEST}");
+        let mut path = format!("{ARTIFACTS}/{DESCRIPTOR}");
         append_object_path(&mut path, &descriptor.sha256()?)?;
         self.0.dir.try_exists(path).map_err(Into::into)
     }
