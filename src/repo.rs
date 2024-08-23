@@ -1,3 +1,4 @@
+use core::str;
 use std::collections::hash_map::VacantEntry;
 use std::collections::HashMap;
 use std::fs::File;
@@ -5,6 +6,7 @@ use std::io::{self, BufReader, Seek, Write};
 use std::ops::Add;
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -15,11 +17,11 @@ use cap_std_ext::cap_tempfile::{TempDir, TempFile};
 use cap_std_ext::cmdext::CapStdExtCommandExt;
 use cap_std_ext::dirext::CapStdExtDirExt;
 use cap_std_ext::{cap_std, cap_tempfile};
-use composefs::dumpfile::{Entry, Item, Mtime};
+use composefs::dumpfile::{DumpConfig, Entry, Item, Mtime};
 use composefs::fsverity::Digest;
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
-use ocidir::oci_spec::image::{Descriptor, MediaType};
+use ocidir::oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
 use rustix::fs::AtFlags;
@@ -48,6 +50,9 @@ const LAYERS: &str = "layers";
 ///   /descriptor/<sha256>
 const ARTIFACTS: &str = "artifacts";
 const TMP: &str = "tmp";
+/// The extended attribute we store only inside the composefs
+/// which has the sha256 for the manifest.json.
+const MANIFEST_SHA256_XATTR: &str = "user.composefs.sha256";
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &'static str = "../../";
 const DESCRIPTOR_UPLINK: &'static str = "../../objects/";
@@ -76,8 +81,7 @@ fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> Obje
 #[context("Parsing object link")]
 fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     // It's an error if we find non-UTF8 content here
-    let mut buf = String::from_utf8(buf)
-        .map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
+    let mut buf = String::from_utf8(buf).map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
     while buf.starts_with("../") {
         buf.replace_range(0..3, "");
     }
@@ -562,42 +566,21 @@ impl RepoTransaction {
         Ok(buf)
     }
 
-    /// Import an object which also has a known descriptor. The descriptor will be validated (size and content-sha256),
-    /// and upon success a symlink will be added in objects/by-sha256 with the descriptor's content-sha256.
+    /// Import an object which also has a known descriptor. The descriptor will be validated (size and content-sha256).
     fn import_descriptor(
         &self,
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
     ) -> Result<ObjectDigest> {
         let tmpf = tmpf.finish_validate(&descriptor)?;
-        let objid = self.import_object(tmpf)?;
-        let (parent, digest) = path_components_for_descriptor(descriptor)?;
-        let basepath = format!("{ARTIFACTS}/{DESCRIPTOR}/{parent}");
-        self.repo
-            .0
-            .dir
-            .ensure_dir_with(&basepath, &default_dirbuilder())
-            .with_context(|| format!("Creating descriptor dir {basepath}"))?;
-        let objpath = object_digest_to_path_prefixed(objid, &DESCRIPTOR_UPLINK);
-        let target_path = format!("{basepath}/{digest}");
-        ignore_rustix_eexist(rustix::fs::symlinkat(
-            objpath.as_std_path(),
-            &self.repo.0.dir,
-            &target_path,
-        ))?;
-        tracing::debug!("Added descriptor {target_path}",);
-        Ok(objid)
+        self.import_object(tmpf)
     }
 
     fn add_artifact_tag(&self, descriptor: &Descriptor, name: &str) -> Result<()> {
-        let quoted = percent_encoding::percent_encode(name.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
+        let quoted =
+            percent_encoding::percent_encode(name.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
         let (parent, digest) = path_components_for_descriptor(descriptor)?;
-        let descriptor_path = format!("../");
-        ignore_rustix_eexist(rustix::fs::symlinkat(
-            objpath.as_std_path(),
-            &self.repo.0.dir,
-            tagpath.as_std_path(),
-        ))
+        todo!()
     }
 
     #[context("Unpacking regfile")]
@@ -723,6 +706,14 @@ fn path_components_for_descriptor(descriptor: &Descriptor) -> Result<(String, Sh
 fn path_for_descriptor(descriptor: &Descriptor) -> Result<Utf8PathBuf> {
     let (parent, sha256) = path_components_for_descriptor(descriptor)?;
     Ok(format!("{parent}/{sha256}").into())
+}
+
+/// Metadata contained inside the composefs file.
+/// Note that the manifest has a descriptor for the config.
+struct Metadata {
+    manifest_descriptor: Descriptor,
+    manifest: ImageManifest,
+    config: ImageConfiguration,
 }
 
 #[derive(Debug)]
@@ -880,18 +871,104 @@ impl Repo {
         Ok(f.map(|f| f.into_std()))
     }
 
+    #[context("Reading object from composefs entry")]
+    fn read_object_from_entry(&self, e: &Entry) -> Result<(File, u64)> {
+        let Item::Regular {
+            size,
+            inline_content,
+            fsverity_digest,
+            ..
+        } = &e.item
+        else {
+            anyhow::bail!("Not a regular file");
+        };
+        let size = *size;
+        // For now we don't need to handle this
+        if inline_content.is_some() {
+            anyhow::bail!("Unexpected inline content");
+        }
+        let Some(digest) = fsverity_digest else {
+            anyhow::bail!("Missing fsverity digest");
+        };
+        let path = object_digest_to_path(digest.clone());
+        let r = self.0.objects.open(&path)?.into_std();
+        // Before we return let's sanity check this since it's cheap to do
+        let meta = r.metadata()?;
+        if meta.size() != size {
+            anyhow::bail!(
+                "Unexpected size for object {path}; expected={size} got={}",
+                meta.size()
+            );
+        }
+        Ok((r, size))
+    }
+
     #[context("Reading tag {:?}", tag)]
-    fn lookup_artifact_tag(&self, tag: &str) -> Result<Option<Descriptor>> {
+    fn read_artifact_metadata(&self, tag: &str) -> Result<Option<Metadata>> {
         let tag_filename =
             percent_encoding::utf8_percent_encode(tag, percent_encoding::NON_ALPHANUMERIC);
         let tagpath: Utf8PathBuf = format!("{ARTIFACTS}/{TAGS}/{tag_filename}").into();
-        let buf = match rustix::fs::readlinkat(&self.0.dir, tagpath.as_std_path(), Vec::new()) {
-            Ok(r) => r,
-            Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let Some(f) = self.0.dir.open_optional(&tagpath)?.map(|f| f.into_std()) else {
+            return Ok(None);
         };
-        let mut buf = buf.into_string()?;
-        todo!()
+        self.read_composefs_metadata(f)
+    }
+
+    // Parse a composefs file, reading the manifest and config
+    fn read_composefs_metadata(&self, f: File) -> Result<Option<Metadata>> {
+        const MANIFEST_NAME: &str = "manifest.json";
+        const CONFIG_NAME: &str = "config.json";
+        let mut filter = DumpConfig::default();
+        filter.filters = Some(&[MANIFEST_NAME, CONFIG_NAME]);
+        let mut manifest: Option<(Descriptor, ImageManifest)> = None;
+        let mut config: Option<ImageConfiguration> = None;
+        composefs::dumpfile::dump(f, filter, |e| {
+            let path = &e.path;
+            let Some(path) = e.path.to_str() else {
+                anyhow::bail!("Invalid UTF-8 in composefs: {path:?}")
+            };
+            let (f, size) = self
+                .read_object_from_entry(&e)
+                .with_context(|| format!("Loading {path}"))?;
+            let f = BufReader::new(f);
+            match path {
+                MANIFEST_NAME => {
+                    let digest_xattr = e
+                        .xattrs
+                        .iter()
+                        .find(|x| x.key.to_str() == Some(MANIFEST_SHA256_XATTR))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Missing {MANIFEST_SHA256_XATTR} in {MANIFEST_NAME}")
+                        })?;
+                    let digest_str = str::from_utf8(&digest_xattr.value)
+                        .map_err(anyhow::Error::new)
+                        .and_then(Sha256Hex::new)
+                        .context("Parsing {MANIFEST_SHA256_XATTR}")?;
+                    let descriptor = Descriptor::new(
+                        MediaType::ImageManifest,
+                        size.try_into().unwrap(),
+                        digest_str.to_descriptor_digest(),
+                    );
+                    manifest = Some((descriptor, serde_json::from_reader(f)?));
+                }
+                CONFIG_NAME => {
+                    config = serde_json::from_reader(f)?;
+                }
+                o => {
+                    anyhow::bail!("Unexpected output path: {o}")
+                }
+            };
+            Ok(())
+        })?;
+        let (manifest_descriptor, manifest) =
+            manifest.ok_or_else(|| anyhow::anyhow!("Missing manifest.json in composefs"))?;
+        let config = config.ok_or_else(|| anyhow::anyhow!("Missing config.json in composefs"))?;
+        let r = Metadata {
+            manifest_descriptor,
+            manifest,
+            config,
+        };
+        Ok(Some(r))
     }
 
     /// Returns true if this layer is stored in expanded form.
@@ -948,15 +1025,15 @@ impl Repo {
         .unwrap()
     }
 
-    /// Pull the target artifact
+    /// Pull the target artifact; does not update the tag if it already exists
     pub async fn pull_artifact(
         &self,
         txn: RepoTransaction,
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
     ) -> Result<(RepoTransaction, Descriptor)> {
-        if let Some(d) = self.lookup_artifact_tag(imgref)? {
-            return Ok((txn, d));
+        if let Some(meta) = self.read_artifact_metadata(imgref)? {
+            return Ok((txn, meta.manifest_descriptor));
         }
 
         let img = proxy.open_image(&imgref).await?;
@@ -966,9 +1043,7 @@ impl Repo {
             raw_manifest.len().try_into().unwrap(),
             &manifest_digest,
         );
-        let manifest_fsverity = if let Some(v) = self.lookup_descriptor(&manifest_descriptor)? {
-            v
-        } else {
+        let manifest_fsverity = {
             let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
             txn.import_descriptor(tmpf, &manifest_descriptor)?
         };
