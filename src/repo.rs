@@ -74,11 +74,9 @@ fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> Obje
 }
 
 #[context("Parsing object link")]
-fn object_link_to_digest(buf: std::path::PathBuf) -> Result<ObjectDigest> {
+fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     // It's an error if we find non-UTF8 content here
-    let mut buf = buf
-        .into_os_string()
-        .into_string()
+    let mut buf = String::from_utf8(buf)
         .map_err(|_| anyhow::anyhow!("Invalid UTF-8"))?;
     while buf.starts_with("../") {
         buf.replace_range(0..3, "");
@@ -570,7 +568,7 @@ impl RepoTransaction {
         &self,
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
-    ) -> Result<ObjectPath> {
+    ) -> Result<ObjectDigest> {
         let tmpf = tmpf.finish_validate(&descriptor)?;
         let objid = self.import_object(tmpf)?;
         let (parent, digest) = path_components_for_descriptor(descriptor)?;
@@ -588,11 +586,13 @@ impl RepoTransaction {
             &target_path,
         ))?;
         tracing::debug!("Added descriptor {target_path}",);
-        Ok(objpath)
+        Ok(objid)
     }
 
-    fn add_tag(&self, objid: ObjectDigest, tagpath: &Utf8Path) -> Result<()> {
-        let objpath = object_digest_to_path_prefixed(objid, TAG_UPLINK);
+    fn add_artifact_tag(&self, descriptor: &Descriptor, name: &str) -> Result<()> {
+        let quoted = percent_encoding::percent_encode(name.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
+        let (parent, digest) = path_components_for_descriptor(descriptor)?;
+        let descriptor_path = format!("../");
         ignore_rustix_eexist(rustix::fs::symlinkat(
             objpath.as_std_path(),
             &self.repo.0.dir,
@@ -891,17 +891,7 @@ impl Repo {
             Err(e) => return Err(e.into()),
         };
         let mut buf = buf.into_string()?;
-        if !(buf.chars().all(|c| c.is_ascii())
-            && buf.starts_with(TAG_UPLINK)
-            && buf.bytes().nth(2) == Some(b'/'))
-        {
-            anyhow::bail!("Invalid descriptor symlink: {buf}");
-        }
-        buf.replace_range(0..TAG_UPLINK.len(), "");
-        buf.remove(2);
-        // Verify
-        let digest = Sha256Hex::new(&buf)?;
-        self.read_descriptor_verified(digest).map(Some)
+        todo!()
     }
 
     /// Returns true if this layer is stored in expanded form.
@@ -965,10 +955,8 @@ impl Repo {
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
     ) -> Result<(RepoTransaction, Descriptor)> {
-        let existing_descriptor = self.lookup_artifact_tag(imgref)?;
-
-        if self.0.dir.try_exists(&img_path)? {
-            return Ok((txn, todo!()));
+        if let Some(d) = self.lookup_artifact_tag(imgref)? {
+            return Ok((txn, d));
         }
 
         let img = proxy.open_image(&imgref).await?;
@@ -984,17 +972,6 @@ impl Repo {
             let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
             txn.import_descriptor(tmpf, &manifest_descriptor)?
         };
-
-        if self.has_artifact_manifest(&manifest_descriptor)? {
-            tracing::debug!("Already stored: {manifest_digest}");
-            return Ok((txn, manifest_descriptor));
-        }
-
-        // Import the manifest
-        {
-            let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
-            txn.import_descriptor(tmpf, &manifest_descriptor)?;
-        }
 
         let manifest =
             ocidir::oci_spec::image::ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
@@ -1113,7 +1090,7 @@ impl Repo {
         let mut cfs_objid = mkcfs_result.unwrap()?;
         let _: () = send_result?;
 
-        txn.add_tag(cfs_objid, &img_path)?;
+        //txn.add_tag(cfs_objid, &img_path)?;
 
         // let repo = self.clone();
         // tokio::task::spawn_blocking(move || -> Result<_> {
