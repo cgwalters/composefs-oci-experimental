@@ -1,6 +1,6 @@
 use core::str;
 use std::collections::hash_map::VacantEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, Seek, Write};
 use std::ops::Add;
@@ -40,16 +40,24 @@ const OBJECTS_BY_SHA256: &str = "objects/by-sha256";
 const IMAGES: &str = "images";
 /// A subdirectory of images/ or artifacts/, hardlink farm
 const TAGS: &str = "tags";
-/// /descriptor/<url encoded MIME type>/<object id>
+/// /descriptor/<url encoded MIME type>/<sha256>
 const DESCRIPTOR: &str = "descriptor";
 /// A subdirectory of images/
 const LAYERS: &str = "layers";
 /// Generic OCI artifacts (may be container images, or may not be)
 /// /artifacts
-///   /tags/<urlencoded>
-///   /descriptor/<sha256>
+///   /tags/<urlencoded name>
+///   /descriptor/<url encoded MIME type>/<sha256>
 const ARTIFACTS: &str = "artifacts";
 const TMP: &str = "tmp";
+
+/// Filename for manifest inside composefs
+const MANIFEST_NAME: &str = "manifest.json";
+/// Filename for config inside composefs
+const CONFIG_NAME: &str = "config.json";
+/// Filename for layers inside composefs; note this is not present for "unpacked" images.
+const LAYERS_NAME: &str = "layers";
+
 /// The extended attribute we store only inside the composefs
 /// which has the sha256 for the manifest.json.
 const MANIFEST_SHA256_XATTR: &str = "user.composefs.sha256";
@@ -74,6 +82,9 @@ fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> Obje
     // Ensure we are only passed an object id
     assert_eq!(objid.len(), 64);
     objid.insert(2, '/');
+    if !prefix.ends_with('/') {
+        objid.insert(0, '/');
+    }
     objid.insert_str(0, prefix);
     objid.into()
 }
@@ -251,7 +262,8 @@ impl<'a> DescriptorWriter<'a> {
         Ok((desc, tempfile))
     }
 
-    fn finish_validate(mut self, descriptor: &Descriptor) -> Result<TempFile<'a>> {
+    #[context("Validating descriptor {}", descriptor.digest())]
+    fn finish_validate(mut self, descriptor: &Descriptor) -> Result<(TempFile<'a>, Sha256Hex)> {
         let descriptor_size: u64 = descriptor.size().try_into()?;
         if descriptor_size != self.size {
             anyhow::bail!(
@@ -260,14 +272,14 @@ impl<'a> DescriptorWriter<'a> {
             );
         }
         let found_sha256 = hex::encode(self.sha256hasher.finish()?);
-        let expected_sha256 = &*descriptor.sha256()?;
-        if found_sha256 != expected_sha256 {
+        let expected_sha256 = descriptor.sha256()?;
+        if found_sha256 != &*expected_sha256 {
             anyhow::bail!(
                 "Corrupted object, expected sha256:{expected_sha256} got sha256:{found_sha256}"
             );
         }
         // SAFETY: Nothing else should have taken this value
-        Ok(self.target.take().unwrap())
+        Ok((self.target.take().unwrap(), expected_sha256))
     }
 }
 
@@ -416,6 +428,7 @@ impl RepoTransaction {
         Ok(r)
     }
 
+    #[context("Creating new object")]
     fn new_object(&self) -> Result<TempFile> {
         TempFile::new(&self.repo.0.objects).map_err(Into::into)
     }
@@ -572,15 +585,38 @@ impl RepoTransaction {
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
     ) -> Result<ObjectDigest> {
-        let tmpf = tmpf.finish_validate(&descriptor)?;
+        let tmpf = tmpf.finish_validate(&descriptor)?.0;
         self.import_object(tmpf)
     }
 
-    fn add_artifact_tag(&self, descriptor: &Descriptor, name: &str) -> Result<()> {
-        let quoted =
-            percent_encoding::percent_encode(name.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
-        let (parent, digest) = path_components_for_descriptor(descriptor)?;
-        todo!()
+    /// Like [`import_descriptor`], but also adds a link that allows lookup by sha256 digest.
+    fn import_descriptor_linked(
+        &self,
+        tmpf: DescriptorWriter,
+        descriptor: &Descriptor,
+    ) -> Result<ObjectDigest> {
+        let (tmpf, descriptor_digest) = tmpf.finish_validate(&descriptor)?;
+        let objid = self.import_object(tmpf)?;
+        let descriptor_path =
+            object_digest_to_path_prefixed(descriptor_digest.to_string(), OBJECTS_BY_SHA256);
+        let target_path = object_digest_to_path_prefixed(objid.clone(), BY_SHA256_UPLINK);
+        ignore_rustix_eexist(rustix::fs::symlinkat(
+            target_path.as_std_path(),
+            &self.repo.0.dir,
+            descriptor_path.as_std_path(),
+        ))?;
+        Ok(objid)
+    }
+
+    /// Import bytes which also has a known descriptor. The descriptor will be validated (size and content-sha256).
+    fn import_descriptor_from_bytes(
+        &self,
+        descriptor: &Descriptor,
+        buf: &[u8],
+    ) -> Result<ObjectDigest> {
+        let tmpf = self.new_descriptor_with_bytes(buf)?;
+        let tmpf = tmpf.finish_validate(&descriptor)?.0;
+        self.import_object(tmpf)
     }
 
     #[context("Unpacking regfile")]
@@ -614,6 +650,7 @@ impl RepoTransaction {
     }
 
     // Commit this transaction, returning statistics
+    #[context("Committing")]
     async fn commit(self) -> Result<TransactionStats> {
         std::process::Command::new("find")
             .args(["-type", "f"])
@@ -669,6 +706,7 @@ fn dir_cfs_entry(path: &Utf8Path) -> Entry<'_> {
     }
 }
 
+#[context("Creating cfs entry for descriptor")]
 fn cfs_entry_for_descriptor(
     d: &Descriptor,
     fsverity_digest: &str,
@@ -686,7 +724,7 @@ fn cfs_entry_for_descriptor(
         path: path.into(),
         uid: 0,
         gid: 0,
-        mode: 0400,
+        mode: libc::S_IFREG | 0400,
         mtime: Mtime { sec: 0, nsec: 0 },
         item,
         xattrs: Default::default(),
@@ -821,54 +859,24 @@ impl Repo {
     }
 
     #[context("Reading object path of descriptor {digest}")]
-    fn descriptor_digest_to_objid(&self, digest: Sha256Hex) -> Result<Option<ObjectDigest>> {
-        let mut by_sha256_path = String::from(OBJECTS_BY_SHA256);
-        append_object_path(&mut by_sha256_path, &digest)?;
-        let buf = match rustix::fs::readlinkat(&self.0.dir, &by_sha256_path, Vec::new()) {
-            Ok(r) => r,
-            Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let mut buf = buf.into_string()?;
-        if !(buf.chars().all(|c| c.is_ascii())
-            && buf.starts_with(BY_SHA256_UPLINK)
-            && buf.bytes().nth(2) == Some(b'/'))
-        {
-            anyhow::bail!("Invalid descriptor symlink: {buf}");
-        }
-        buf.replace_range(0..BY_SHA256_UPLINK.len(), "");
-        buf.remove(2);
-        // Verify
-        let _ = Sha256Hex::new(&buf);
-        Ok(Some(buf))
-    }
-
-    fn lookup_descriptor(&self, descriptor: &Descriptor) -> Result<Option<ObjectDigest>> {
-        let path = path_for_descriptor(descriptor)?;
+    fn lookup_object_by_descriptor_digest(
+        &self,
+        digest: Sha256Hex,
+    ) -> Result<Option<ObjectDigest>> {
+        let path = object_digest_to_path_prefixed(digest.to_string(), OBJECTS_BY_SHA256);
         let buf = match rustix::fs::readlinkat(&self.0.dir, path.as_std_path(), Vec::new()) {
             Ok(r) => r,
             Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let mut buf = buf.into_string()?;
-        if !(buf.chars().all(|c| c.is_ascii())
-            && buf.starts_with(BY_SHA256_UPLINK)
-            && buf.bytes().nth(2) == Some(b'/'))
-        {
-            anyhow::bail!("Invalid descriptor symlink: {buf}");
-        }
-        buf.replace_range(0..BY_SHA256_UPLINK.len(), "");
-        buf.remove(2);
-        // Verify
-        let _ = Sha256Hex::new(&buf);
-        Ok(Some(buf))
+        let objid = object_link_to_digest(buf.into_bytes())?;
+        Ok(Some(objid))
     }
 
-    #[context("Reading descriptor sha256:{}", descriptor.digest())]
-    fn read_descriptor(&self, descriptor: &Descriptor) -> Result<Option<File>> {
-        let path = path_for_descriptor(descriptor)?;
-        let f = self.0.dir.open_optional(&path)?;
-        Ok(f.map(|f| f.into_std()))
+    #[context("Looking up descriptor")]
+    fn lookup_descriptor(&self, descriptor: &Descriptor) -> Result<Option<ObjectDigest>> {
+        let descriptor_sha256 = descriptor.sha256()?;
+        self.lookup_object_by_descriptor_digest(descriptor_sha256)
     }
 
     #[context("Reading object from composefs entry")]
@@ -914,14 +922,14 @@ impl Repo {
         self.read_composefs_metadata(f)
     }
 
-    // Parse a composefs file, reading the manifest and config
+    // Parse a composefs file, reading the manifest and config (and layers if they exist)
     fn read_composefs_metadata(&self, f: File) -> Result<Option<Metadata>> {
-        const MANIFEST_NAME: &str = "manifest.json";
-        const CONFIG_NAME: &str = "config.json";
         let mut filter = DumpConfig::default();
-        filter.filters = Some(&[MANIFEST_NAME, CONFIG_NAME]);
+        filter.filters = Some(&[MANIFEST_NAME, CONFIG_NAME, LAYERS_NAME]);
         let mut manifest: Option<(Descriptor, ImageManifest)> = None;
         let mut config: Option<ImageConfiguration> = None;
+        // Maps descriptor sha256 -> fsverity
+        let mut layers: Option<HashMap<String, ObjectDigest>>;
         composefs::dumpfile::dump(f, filter, |e| {
             let path = &e.path;
             let Some(path) = e.path.to_str() else {
@@ -954,6 +962,7 @@ impl Repo {
                 CONFIG_NAME => {
                     config = serde_json::from_reader(f)?;
                 }
+                p if p.starts_with(LAYERS_NAME) => {}
                 o => {
                     anyhow::bail!("Unexpected output path: {o}")
                 }
@@ -980,9 +989,7 @@ impl Repo {
 
     /// Returns true if descriptor is stored as an object
     fn has_descriptor_object(&self, descriptor: &Descriptor) -> Result<bool> {
-        let mut layer_path = String::from(OBJECTS_BY_SHA256);
-        append_object_path(&mut layer_path, &descriptor.sha256()?)?;
-        self.0.dir.try_exists(layer_path).map_err(Into::into)
+        Ok(self.lookup_descriptor(descriptor)?.is_some())
     }
 
     /// Returns true if this manifest digest is stored as an image
@@ -1036,85 +1043,73 @@ impl Repo {
             return Ok((txn, meta.manifest_descriptor));
         }
 
-        let img = proxy.open_image(&imgref).await?;
-        let (manifest_digest, raw_manifest) = proxy.fetch_manifest_raw_oci(&img).await?;
+        let img = proxy.open_image(&imgref).await.context("Opening image")?;
+        let (manifest_digest, raw_manifest) = proxy
+            .fetch_manifest_raw_oci(&img)
+            .await
+            .context("Fetching manifest")?;
         let manifest_descriptor = Descriptor::new(
-            ocidir::oci_spec::image::MediaType::ImageManifest,
+            MediaType::ImageManifest,
             raw_manifest.len().try_into().unwrap(),
             &manifest_digest,
         );
-        let manifest_fsverity = {
-            let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
-            txn.import_descriptor(tmpf, &manifest_descriptor)?
-        };
+        let manifest_fsverity =
+            txn.import_descriptor_from_bytes(&manifest_descriptor, &raw_manifest)?;
 
-        let manifest =
-            ocidir::oci_spec::image::ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
+        let manifest = ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
         let txn = Arc::new(txn);
         let config_descriptor = manifest.config();
         let config_fsverity = if let Some(v) = self.lookup_descriptor(&config_descriptor)? {
             v
         } else {
-            let config_raw = proxy.fetch_config_raw(&img).await?;
             // Import the config
-            let tmpf = txn.new_descriptor_with_bytes(&config_raw)?;
-            txn.import_descriptor(tmpf, &config_descriptor)?
+            let config_raw = proxy.fetch_config_raw(&img).await?;
+            txn.import_descriptor_from_bytes(&config_descriptor, &config_raw)?
         };
 
-        let layers_to_fetch =
-            manifest
-                .layers()
-                .iter()
-                .try_fold(Vec::new(), |mut acc, layer| -> Result<_> {
-                    if !self.has_descriptor_object(layer)? {
-                        acc.push(layer);
-                    }
-                    Ok(acc)
-                })?;
+        let mut layers_by_digest = HashMap::new();
+        let (mut existing_layers, to_fetch_layers) = manifest.layers().iter().try_fold(
+            (HashMap::new(), HashSet::new()),
+            |(mut existing, mut to_fetch), layer| -> Result<_> {
+                layers_by_digest.insert(layer.digest(), layer);
+                if let Some(objid) = self.lookup_descriptor(layer)? {
+                    existing.insert(layer.digest(), objid);
+                } else {
+                    to_fetch.insert(layer.digest());
+                }
+                Ok((existing, to_fetch))
+            },
+        )?;
 
-        tracing::debug!("Layers to fetch: {}", layers_to_fetch.len());
-        for layer in layers_to_fetch {
+        tracing::debug!("Layers to fetch: {}", to_fetch_layers.len());
+        for layer_digest in to_fetch_layers.iter() {
+            // SAFETY: Must exist
+            let layer = *layers_by_digest.get(layer_digest).unwrap();
             let size = layer.size().try_into().context("Invalid size")?;
             let (blob_reader, driver) = proxy.get_blob(&img, layer.digest(), size).await?;
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Clone to move into worker thread
-            let layer = layer.clone();
+            let layer_copy = layer.clone();
             let txn = Arc::clone(&txn);
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut tmpf = DescriptorWriter::new(txn.new_object()?)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut tmpf)?;
-                txn.import_descriptor(tmpf, &layer)?;
-                Ok(())
+                txn.import_descriptor_linked(tmpf, &layer_copy)
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
             let _: () = driver?;
-            let _: () = import_task.unwrap()?;
+            let objid = import_task.unwrap()?;
+            existing_layers.insert(layer.digest(), objid);
         }
         tracing::debug!("Imported all layers");
-
-        // Map from a layer sha256:<hash> to a fsverity digest
-        let layer_digest_to_objid =
-            manifest
-                .layers()
-                .iter()
-                .try_fold(HashMap::new(), |mut acc, layer| {
-                    use std::collections::hash_map::Entry;
-                    if let Entry::Vacant(v) = acc.entry(layer.digest()) {
-                        let objid = txn
-                            .repo
-                            .lookup_descriptor(layer)?
-                            .expect("Should have fetched descriptor");
-                        v.insert(objid);
-                    }
-                    anyhow::Ok(acc)
-                })?;
 
         let (send_entries, recv_entries) = std::sync::mpsc::sync_channel(5);
         let txn_clone = Arc::clone(&txn);
         let cfs_worker = tokio::task::spawn_blocking(move || -> Result<_> {
             let cfs_object = txn_clone.new_object()?;
             let cfs_object_file = cfs_object.as_file().try_clone()?.into_std();
-            composefs::mkcomposefs::mkcomposefs(Default::default(), recv_entries, cfs_object_file)?;
+            composefs::mkcomposefs::mkcomposefs(Default::default(), recv_entries, cfs_object_file)
+                .context("Creating composefs")?;
             let cfs_path = txn_clone.import_object(cfs_object)?;
             tracing::debug!("Committed artifact: {cfs_path}");
             Ok(cfs_path)
@@ -1146,7 +1141,7 @@ impl Repo {
                 return Ok(());
             }
             for (i, layer) in manifest_ref.layers().iter().enumerate() {
-                let digest = layer_digest_to_objid
+                let digest = existing_layers
                     .get(layer.digest())
                     .expect("Should have objid for layer");
                 let path = &format!("/layers/{i}");
@@ -1162,8 +1157,8 @@ impl Repo {
         };
 
         let (mkcfs_result, send_result) = tokio::join!(cfs_worker, send_task);
-        let mut cfs_objid = mkcfs_result.unwrap()?;
-        let _: () = send_result?;
+        let mut cfs_objid = mkcfs_result.unwrap().context("Creating cfs object")?;
+        let _: () = send_result.context("Entry generation")?;
 
         //txn.add_tag(cfs_objid, &img_path)?;
 
@@ -1290,10 +1285,6 @@ impl Add for TransactionStats {
 mod tests {
     use std::io::BufWriter;
     use std::process::Command;
-
-    use ocidir::oci_spec::image::{
-        ImageConfigurationBuilder, ImageManifest, ImageManifestBuilder, Platform,
-    };
 
     use super::*;
 
