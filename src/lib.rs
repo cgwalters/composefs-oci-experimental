@@ -8,7 +8,6 @@ use clap::Parser;
 use ocidir::cap_std;
 use pull::cli_pull;
 
-mod digestsha256;
 mod fileutils;
 pub mod pull;
 pub mod repo;
@@ -71,6 +70,16 @@ pub(crate) struct CreateOpts {
 pub(crate) enum Opt {
     /// Initialize a repo
     Create(CreateOpts),
+    /// List all images
+    List(RepoOpts),
+    /// Query a tag
+    Inspect {
+        #[clap(flatten)]
+        repo_opts: RepoOpts,
+
+        /// Query this tag
+        name: String,
+    },
     /// Pull an image
     Pull(PullOpts),
     Unpack(UnpackOpts),
@@ -95,6 +104,21 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             let repodir = Dir::open_ambient_dir(repopath, cap_std::ambient_authority())?;
             let repo = crate::repo::Repo::init(&repodir, opts.require_verity)?;
             drop(repo);
+            Ok(())
+        }
+        Opt::List(opts) => {
+            let repo = opts.open()?;
+            for tag in repo.list_tags(None).await? {
+                println!("{tag}");
+            }
+            Ok(())
+        }
+        Opt::Inspect { repo_opts, name } => {
+            let repo = repo_opts.open()?;
+            if let Some(meta) = repo.read_artifact_metadata(&name)? {
+                let mut stdout = std::io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &meta)?;
+            }
             Ok(())
         }
         Opt::Pull(opts) => cli_pull(opts).await,

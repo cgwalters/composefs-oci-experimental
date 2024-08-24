@@ -14,7 +14,8 @@ cap-std-ext = "4.0"
 camino = "1"
 clap = { version= "4.2", features = ["derive"] }
 fn-error-context = "0.2.0"
-ocidir = { version = "0.2.1" }
+#ocidir = { version = "0.2.1" }
+ocidir = { path = "../../containers/ocidir-rs" }
 openssl = "0.10.33"
 rustix = { version = "0.38.34", features = ["fs"] }
 libc = "0.2"
@@ -28,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 hex = "0.4.3"
 serde_json = "1.0.117"
+
+[dev-dependencies]
+tempfile = "3"
 
 [[bin]]
 path = "src/bin/main.rs"

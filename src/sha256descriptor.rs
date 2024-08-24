@@ -3,6 +3,8 @@ use std::fmt::Display;
 use anyhow::Result;
 use ocidir::oci_spec::image::Descriptor;
 
+pub(crate) const SHA256_HEXLEN: usize = 64;
+
 /// A string which has been validated as a hexadecimal 64 character string,
 /// which is the most common format for sha-256.
 pub(crate) struct Sha256Hex<'a>(&'a str);
@@ -13,7 +15,7 @@ fn is_ascii_hex_lowercase(c: char) -> bool {
 
 impl<'a> Sha256Hex<'a> {
     pub(crate) fn new(digest: &'a str) -> Result<Self> {
-        if digest.len() != 64 || !digest.chars().all(is_ascii_hex_lowercase) {
+        if digest.len() != SHA256_HEXLEN || !digest.chars().all(is_ascii_hex_lowercase) {
             anyhow::bail!("Invalid sha256: {}", digest);
         }
         Ok(Self(digest))
