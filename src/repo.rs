@@ -1041,7 +1041,9 @@ impl Repo {
         } else {
             // Import the config
             let size: u64 = config_descriptor.size().try_into()?;
-            let (mut config, driver) = proxy.get_blob(&img, config_descriptor.digest(), size).await?;
+            let (mut config, driver) = proxy
+                .get_blob(&img, config_descriptor.digest(), size)
+                .await?;
             let config = async move {
                 let mut s = Vec::new();
                 config.read_to_end(&mut s).await?;
@@ -1404,6 +1406,13 @@ mod tests {
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 4);
         assert_eq!(r.imported_objects_size, 16994);
+
+        let tags = repo.list_tags(None).await?;
+        assert_eq!(tags.len(), 1);
+        similar_asserts::assert_eq!(tags[0].as_str(), imgref);
+
+        let found_desc = repo.read_artifact_metadata(&imgref).unwrap().unwrap();
+        assert_eq!(&found_desc.manifest_descriptor, &desc);
 
         Ok(())
     }
