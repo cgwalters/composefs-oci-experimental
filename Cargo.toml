@@ -14,8 +14,7 @@ cap-std-ext = "4.0"
 camino = "1"
 clap = { version= "4.2", features = ["derive"] }
 fn-error-context = "0.2.0"
-#ocidir = { version = "0.2.1" }
-ocidir = { path = "../../containers/ocidir-rs" }
+ocidir = { version = "0.2.1" }
 openssl = "0.10.33"
 rustix = { version = "0.38.34", features = ["fs"] }
 libc = "0.2"

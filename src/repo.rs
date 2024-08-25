@@ -28,6 +28,7 @@ use rustix::fd::BorrowedFd;
 use rustix::fs::AtFlags;
 use rustix::path::Arg;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 
 use crate::fileutils::{self, default_dirbuilder};
 use crate::sha256descriptor::{DescriptorExt, Sha256Hex, SHA256_HEXLEN};
@@ -1039,9 +1040,17 @@ impl Repo {
             v
         } else {
             // Import the config
-            let config_raw = proxy.fetch_config_raw(&img).await?;
-            dbg!(config_raw.to_string_lossy());
-            txn.import_descriptor_from_bytes(&config_descriptor, &config_raw)
+            let size: u64 = config_descriptor.size().try_into()?;
+            let (mut config, driver) = proxy.get_blob(&img, config_descriptor.digest(), size).await?;
+            let config = async move {
+                let mut s = Vec::new();
+                config.read_to_end(&mut s).await?;
+                anyhow::Ok(s)
+            };
+            let (config, driver) = tokio::join!(config, driver);
+            let _: () = driver?;
+            let config = config?;
+            txn.import_descriptor_from_bytes(&config_descriptor, &config)
                 .context("Importing config")?
         };
 
@@ -1382,13 +1391,6 @@ mod tests {
             Some("latest"),
             Platform::default(),
         )?;
-        {
-            let mut v = Vec::new();
-            let manifest: ImageManifest = ocidir.read_json_blob(&desc)?;
-            ocidir.read_blob(manifest.config())?.read_to_end(&mut v)?;
-            let v = String::from_utf8(v)?;
-            dbg!(v);
-        }
         ocidir.fsck()?;
         let imgref = &format!("oci:{ocipath}:latest");
 
@@ -1400,8 +1402,8 @@ mod tests {
         let (txn, desc) = repo.pull_artifact(txn, &proxy, &imgref).await.unwrap();
         let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
-        assert_eq!(r.imported_objects_count, 0);
-        assert_eq!(r.imported_objects_size, 0);
+        assert_eq!(r.imported_objects_count, 4);
+        assert_eq!(r.imported_objects_size, 16994);
 
         Ok(())
     }
