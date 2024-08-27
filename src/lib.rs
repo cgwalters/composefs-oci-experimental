@@ -6,13 +6,11 @@ use camino::Utf8PathBuf;
 use cap_std::fs::Dir;
 use clap::Parser;
 use ocidir::cap_std;
-use pull::cli_pull;
 
+mod cli;
 mod fileutils;
-pub mod pull;
 pub mod repo;
 mod sha256descriptor;
-mod unpack;
 
 /// Options for specifying the repository
 #[derive(Debug, Parser)]
@@ -121,7 +119,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             }
             Ok(())
         }
-        Opt::Pull(opts) => cli_pull(opts).await,
-        Opt::Unpack(opts) => unpack::cli_unpack(opts).await,
+        Opt::Pull(opts) => cli::pull(opts).await,
+        Opt::Unpack(opts) => cli::unpack(opts).await,
     }
 }
