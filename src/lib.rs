@@ -64,7 +64,7 @@ pub(crate) struct CreateOpts {
 
 /// Toplevel options
 #[derive(Debug, Parser)]
-#[clap(name = "composefs")]
+#[clap(name = "composefs-oci")]
 #[clap(rename_all = "kebab-case")]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Opt {
