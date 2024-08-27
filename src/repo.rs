@@ -1234,8 +1234,7 @@ mod tests {
 
     fn new_memfd(buf: &[u8]) -> Result<File> {
         use rustix::fs::MemfdFlags;
-        let f = rustix::fs::memfd_create("test memfd", MemfdFlags::CLOEXEC)?;
-        let f = File::from(f);
+        let f: File = rustix::fs::memfd_create("test memfd", MemfdFlags::CLOEXEC)?.into();
         let mut bufw = std::io::BufWriter::new(f);
         std::io::copy(&mut std::io::Cursor::new(buf), &mut bufw)?;
         bufw.into_inner().map_err(Into::into)
@@ -1268,8 +1267,9 @@ mod tests {
         let mut testtar = tar::Builder::new(testtar);
         testtar.follow_symlinks(false);
         testtar
-            .append_dir_all("./", "../../tests")
-            .context("creating tar")?;
+            .append_dir_all("./", "src")
+            .context("creating tar")
+            .unwrap();
         drop(testtar.into_inner()?.into_inner()?);
         let digest_o = Command::new("sha256sum")
             .stdin(td.open("test.tar")?)
@@ -1334,7 +1334,7 @@ mod tests {
         let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 4);
-        assert_eq!(r.imported_objects_size, 16994);
+        assert_eq!(r.imported_objects_size, 16996);
 
         let tags = repo.list_tags(None).await?;
         assert_eq!(tags.len(), 1);

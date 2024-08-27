@@ -77,6 +77,12 @@ Note that an artifact may *also* be an OCI image; it is not required to store OC
 Side note: This follows a longstanding tradition of splitting up a digest into (first two bytes, remaining bytes)
 creating subdirectories for the first two bytes. It is used by composefs by default.
 
+### Runtime state
+
+Each cfs-oci directory owned by root defaults to having a corresponding
+`/run/composefs-oci/state/<device,inode>/` directory that holds e.g.
+locks.
+
 ## CLI sketch: OCI container images
 
 `cfs-oci --repo=/path/to/repo image list|pull|rm|mount`
