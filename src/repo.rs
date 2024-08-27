@@ -26,12 +26,14 @@ use ocidir::oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, Med
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
 use rustix::fs::AtFlags;
-use rustix::path::Arg;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use crate::fileutils::{self, default_dirbuilder};
-use crate::sha256descriptor::{DescriptorExt, Sha256Hex, SHA256_HEXLEN};
+use crate::fileutils::{
+    self, default_dirbuilder, ignore_rustix_eexist, ignore_std_eexist, linkat_allow_exists,
+    linkat_optional_allow_exists,
+};
+use crate::sha256descriptor::{DescriptorExt, Sha256Hex};
 
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
@@ -66,14 +68,12 @@ const LAYERS_NAME: &str = "layers";
 const MANIFEST_SHA256_XATTR: &str = "user.composefs.sha256";
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &'static str = "../../";
-const TAG_UPLINK: &'static str = "../../objects/";
 
 /// Can be included in a manifest if the digest is pre-computed
-const CFS_DIGEST_ANNOTATION: &str = "composefs.rootfs.digest";
+const CFS_DIGEST_ANNOTATION: &str = "composefs.digest";
 
 type SharedObjectDirs = Arc<Mutex<Vec<Dir>>>;
 type ObjectDigest = String;
-type DescriptorDigest = String;
 type ObjectPath = Utf8PathBuf;
 
 fn object_digest_to_path(objid: ObjectDigest) -> ObjectPath {
@@ -144,51 +144,50 @@ fn get_bootid() -> &'static str {
     bootid.as_str()
 }
 
-fn create_entry(_h: tar::Header) -> Result<Entry<'static>> {
-    // let size = h.size()?;
-    // let path = &*h.path()?;
-    // let path = Utf8Path::from_path(path)
-    //     .ok_or_else(|| anyhow::anyhow!("Invalid non-UTF8 path: {path:?}"))?;
-    // let path: Cow<std::path::Path> = Cow::Owned(PathBuf::from("."));
-    // let mtime = dumpfile::Mtime {
-    //     sec: h.mtime()?,
-    //     nsec: 0,
-    // };
-    // // The data below are stubs, we'll fix it up after
-    // let nlink = 1;
-    // let inline_content = None;
-    // let fsverity_digest = None;
+// fn create_entry(_h: tar::Header) -> Result<Entry<'static>> {
+// let size = h.size()?;
+// let path = &*h.path()?;
+// let path = Utf8Path::from_path(path)
+//     .ok_or_else(|| anyhow::anyhow!("Invalid non-UTF8 path: {path:?}"))?;
+// let path: Cow<std::path::Path> = Cow::Owned(PathBuf::from("."));
+// let mtime = dumpfile::Mtime {
+//     sec: h.mtime()?,
+//     nsec: 0,
+// };
+// // The data below are stubs, we'll fix it up after
+// let nlink = 1;
+// let inline_content = None;
+// let fsverity_digest = None;
 
-    // use dumpfile::Item;
-    // let item = match h.entry_type() {
-    //     tar::EntryType::Regular => {}
-    //     tar::EntryType::Link => todo!(),
-    //     tar::EntryType::Symlink => todo!(),
-    //     tar::EntryType::Char => todo!(),
-    //     tar::EntryType::Block => todo!(),
-    //     tar::EntryType::Directory => todo!(),
-    //     tar::EntryType::Fifo => todo!(),
-    //     tar::EntryType::Continuous => todo!(),
-    //     tar::EntryType::GNULongName => todo!(),
-    //     tar::EntryType::GNULongLink => todo!(),
-    //     tar::EntryType::GNUSparse => todo!(),
-    //     tar::EntryType::XGlobalHeader => todo!(),
-    //     tar::EntryType::XHeader => todo!(),
-    //     _ => todo!(),
-    // };
+// use dumpfile::Item;
+// let item = match h.entry_type() {
+//     tar::EntryType::Regular => {}
+//     tar::EntryType::Link => todo!(),
+//     tar::EntryType::Symlink => todo!(),
+//     tar::EntryType::Char => todo!(),
+//     tar::EntryType::Block => todo!(),
+//     tar::EntryType::Directory => todo!(),
+//     tar::EntryType::Fifo => todo!(),
+//     tar::EntryType::Continuous => todo!(),
+//     tar::EntryType::GNULongName => todo!(),
+//     tar::EntryType::GNULongLink => todo!(),
+//     tar::EntryType::GNUSparse => todo!(),
+//     tar::EntryType::XGlobalHeader => todo!(),
+//     tar::EntryType::XHeader => todo!(),
+//     _ => todo!(),
+// };
 
-    // let entry = Entry {
-    //     path,
-    //     uid: h.uid().context("uid")?.try_into()?,
-    //     gid: h.gid().context("gid")?.try_into()?,
-    //     mode: h.mode().context("mode")?,
-    //     mtime,
-    //     item: todo!(),
-    //     xattrs: todo!(),
-    // };
-
-    todo!()
-}
+// let entry = Entry {
+//     path,
+//     uid: h.uid().context("uid")?.try_into()?,
+//     gid: h.gid().context("gid")?.try_into()?,
+//     mode: h.mode().context("mode")?,
+//     mtime,
+//     item: todo!(),
+//     xattrs: todo!(),
+// };
+//     todo!()
+// }
 
 /// A writer which writes an object identified by sha256.
 pub struct DescriptorWriter<'a> {
@@ -284,60 +283,6 @@ fn test_fsverity_in(d: &Dir) -> Result<bool> {
     tf.write_all(b"test")?;
     fileutils::reopen_tmpfile_ro(&mut tf)?;
     Ok(composefs::fsverity::fsverity_enable(tf.as_file().as_fd()).is_ok())
-}
-
-fn linkat_optional_allow_exists(
-    old_dirfd: &Dir,
-    old_path: impl AsRef<Path>,
-    new_dirfd: &Dir,
-    new_path: impl AsRef<Path>,
-) -> Result<bool> {
-    match rustix::fs::linkat(
-        old_dirfd.as_fd(),
-        old_path.as_ref(),
-        new_dirfd.as_fd(),
-        new_path.as_ref(),
-        AtFlags::empty(),
-    ) {
-        // We successfully linked
-        Ok(()) => Ok(true),
-        // We're idempotent; it's ok if the target already exists
-        Err(e) if e == rustix::io::Errno::EXIST => Ok(true),
-        // Not finding it is just a cache miss
-        Err(e) if e == rustix::io::Errno::NOENT => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn ignore_rustix_eexist(r: rustix::io::Result<()>) -> Result<()> {
-    match r {
-        Ok(()) => Ok(()),
-        Err(e) if e == rustix::io::Errno::EXIST => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn ignore_std_eexist(r: io::Result<()>) -> Result<()> {
-    match r {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn linkat_allow_exists(
-    old_dirfd: impl AsFd,
-    old_path: impl AsRef<Path>,
-    new_dirfd: impl AsFd,
-    new_path: impl AsRef<Path>,
-) -> Result<()> {
-    ignore_rustix_eexist(rustix::fs::linkat(
-        old_dirfd.as_fd(),
-        old_path.as_ref(),
-        new_dirfd.as_fd(),
-        new_path.as_ref(),
-        AtFlags::empty(),
-    ))
 }
 
 // Rename all regular files from -> to. Non-regular and non-symlink files will be ignored.
@@ -678,10 +623,10 @@ impl RepoTransaction {
     }
 }
 
-fn dir_cfs_entry(path: &Utf8Path) -> Entry<'_> {
+fn dir_cfs_entry(path: &Utf8Path) -> Entry<'static> {
     let item = Item::Directory { size: 0, nlink: 1 };
     Entry {
-        path: path.into(),
+        path: Cow::Owned(path.into()),
         uid: 0,
         gid: 0,
         mode: libc::S_IFDIR | 0700,
@@ -723,20 +668,6 @@ fn cfs_entry_for_descriptor(
         xattrs,
     };
     Ok(e)
-}
-
-fn path_components_for_descriptor(descriptor: &Descriptor) -> Result<(String, Sha256Hex)> {
-    // TODO https://github.com/containers/oci-spec-rs/pull/200
-    let media_type = descriptor.media_type().to_string();
-    let mtype =
-        percent_encoding::percent_encode(media_type.as_bytes(), percent_encoding::NON_ALPHANUMERIC);
-    let sha256 = descriptor.sha256()?;
-    Ok((mtype.to_string(), sha256))
-}
-
-fn path_for_descriptor(descriptor: &Descriptor) -> Result<Utf8PathBuf> {
-    let (parent, sha256) = path_components_for_descriptor(descriptor)?;
-    Ok(format!("{parent}/{sha256}").into())
 }
 
 /// Metadata contained inside the composefs file.
@@ -873,40 +804,6 @@ impl Repo {
         self.lookup_object_by_descriptor_digest(descriptor_sha256)
     }
 
-    /// Parse a composefs dump entry; if it is a regular file, the fsverity digest and
-    /// size will be returned. Otherwise, returns `None`.
-    #[context("Reading object from composefs entry")]
-    fn read_object_from_entry(&self, e: &Entry) -> Result<Option<(File, u64)>> {
-        let Item::Regular {
-            size,
-            inline_content,
-            fsverity_digest,
-            ..
-        } = &e.item
-        else {
-            return Ok(None);
-        };
-        let size = *size;
-        // For now we don't need to handle this
-        if inline_content.is_some() {
-            anyhow::bail!("Unexpected inline content");
-        }
-        let Some(digest) = fsverity_digest else {
-            anyhow::bail!("Missing fsverity digest");
-        };
-        let path = object_digest_to_path(digest.clone());
-        let r = self.0.objects.open(&path)?.into_std();
-        // Before we return let's sanity check this since it's cheap to do
-        let meta = r.metadata()?;
-        if meta.size() != size {
-            anyhow::bail!(
-                "Unexpected size for object {path}; expected={size} got={}",
-                meta.size()
-            );
-        }
-        Ok(Some((r, size)))
-    }
-
     #[context("Reading tag {:?}", tag)]
     pub fn read_artifact_metadata(&self, tag: &str) -> Result<Option<Metadata>> {
         let tagpath = artifact_tag_path(tag);
@@ -923,7 +820,7 @@ impl Repo {
         let mut manifest: Option<(Descriptor, ImageManifest)> = None;
         let mut config: Option<ImageConfiguration> = None;
         // Maps descriptor sha256 -> fsverity
-        let mut layers: Option<HashMap<String, ObjectDigest>>;
+        let mut layers: Option<HashMap<String, ObjectDigest>> = None;
         composefs::dumpfile::dump(f, filter, |e| {
             let path = &e.path;
             let Some(path) = e.path.to_str() else {
@@ -931,14 +828,40 @@ impl Repo {
             };
             let path = path.trim_start_matches('/');
 
-            let Some((f, size)) = self
-                .read_object_from_entry(&e)
-                .with_context(|| format!("Loading {path}"))?
+            let Item::Regular {
+                size,
+                inline_content,
+                fsverity_digest,
+                ..
+            } = &e.item
             else {
-                // Ignore directories
+                // Skip non-regular files (which should really only be directories)
                 return Ok(());
             };
-            let f = BufReader::new(f);
+
+            let size = *size;
+            // For now we don't need to handle this
+            if inline_content.is_some() {
+                anyhow::bail!("Unexpected inline content");
+            }
+            let Some(fsverity_digest) = fsverity_digest else {
+                anyhow::bail!("Missing fsverity digest");
+            };
+
+            let objpath = object_digest_to_path(fsverity_digest.clone());
+            let read_object = || {
+                let r = self.0.objects.open(&objpath)?.into_std();
+                // Before we return let's sanity check this since it's cheap to do
+                let meta = r.metadata()?;
+                if meta.size() != size {
+                    anyhow::bail!(
+                        "Unexpected size for object {objpath}; expected={size} got={}",
+                        meta.size()
+                    );
+                }
+                Ok(BufReader::new(r))
+            };
+
             match path {
                 MANIFEST_NAME => {
                     let digest_xattr = e
@@ -957,12 +880,19 @@ impl Repo {
                         size.try_into().unwrap(),
                         digest_str.to_descriptor_digest(),
                     );
+                    let f = read_object()?;
                     manifest = Some((descriptor, serde_json::from_reader(f)?));
                 }
                 CONFIG_NAME => {
+                    let f = read_object()?;
                     config = serde_json::from_reader(f)?;
                 }
-                p if p.starts_with(LAYERS_NAME) => {}
+                p if p.starts_with(LAYERS_NAME) => {
+                    let digest = p.strip_prefix(LAYERS_NAME).unwrap().trim_start_matches('/');
+                    let digest = Sha256Hex::new(digest)?;
+                    let layers = layers.get_or_insert_with(Default::default);
+                    layers.insert(digest.to_string(), fsverity_digest.clone());
+                }
                 o => {
                     anyhow::bail!("Unexpected output path: {o}")
                 }
@@ -1128,14 +1058,16 @@ impl Repo {
             )?) {
                 return Ok(());
             }
-            if let Err(_) = send_entries.send(dir_cfs_entry("/layers".into())) {
+            let layers_dir = format!("/{LAYERS_NAME}");
+            if let Err(_) = send_entries.send(dir_cfs_entry(layers_dir.as_str().into())) {
                 return Ok(());
             }
             for (i, layer) in manifest_ref.layers().iter().enumerate() {
+                let layer_sha256 = layer.sha256()?;
                 let digest = existing_layers
                     .get(layer.digest())
                     .expect("Should have objid for layer");
-                let path = &format!("/layers/{i}");
+                let path = &format!("/{LAYERS_NAME}/{layer_sha256}");
                 if let Err(_) = send_entries.send(cfs_entry_for_descriptor(
                     &layer,
                     &digest,
@@ -1298,7 +1230,6 @@ mod tests {
     use std::io::BufWriter;
     use std::process::Command;
 
-    use io::Read;
     use ocidir::oci_spec::image::{ImageConfigurationBuilder, Platform};
 
     use super::*;
@@ -1387,7 +1318,7 @@ mod tests {
             Default::default(),
         );
 
-        let desc = ocidir.insert_manifest_and_config(
+        let orig_desc = ocidir.insert_manifest_and_config(
             manifest,
             config,
             Some("latest"),
@@ -1402,6 +1333,8 @@ mod tests {
 
         let txn = repo.new_transaction()?;
         let (txn, desc) = repo.pull_artifact(txn, &proxy, &imgref).await.unwrap();
+        assert_eq!(orig_desc.digest(), desc.digest());
+        assert_eq!(orig_desc.size(), desc.size());
         let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 4);

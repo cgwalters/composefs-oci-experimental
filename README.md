@@ -100,6 +100,47 @@ bootc and podman use separate physical stores in
 on the same filesystem, we can efficiently and safely share
 backing objects!
 
+### Concurrency
+
+Concurrent reads are trivially supportable; everything
+is just a readonly file.
+
+Writes come in three forms:
+
+- Addition
+- Unreferencing
+- Garbage collection
+
+Concurrent additions (e.g. two processes/threads
+pulling two images that may share blobs, or even
+the same image) are "easy"; most files are designed
+to be an "object" which have natural idempotent
+semantics. For example when we go to add an object,
+that's a linkat() operation, and if we get EEXIST
+that's OK - something else succeeded at adding
+the object and we discard our copy.
+
+An "unreference" operation is basically deleting
+a tag. This can race with addition, but it
+is unspecified which operation wins.
+
+Garbage collection is removing objects which
+are no longer referenced. Having GC run
+concurrently with addition is the challenge.
+
+The simplest solution is:
+
+- A read-write lock
+- Read operations claim read lock
+- GC operates in "mark and sweep" model; mark
+  phase holds a read lock; scan all roots and
+  note live objects. When this finishes, grab
+  write lock. Find any *new* roots added between
+  those two phases, and scan them. Prune all
+  unreferenced objects.
+
+
+
 ### Injecting "flattened" composefs digests
 
 Another verb that should be supported here is:

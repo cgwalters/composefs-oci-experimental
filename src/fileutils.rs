@@ -2,14 +2,13 @@ use std::io;
 use std::path::Path;
 
 use anyhow::Result;
-use cap_std_ext::{
-    cap_std::fs::{
-        DirBuilder, DirBuilderExt as _, OpenOptions, OpenOptionsExt as _, Permissions,
-        PermissionsExt as _,
-    },
-    cap_tempfile::TempFile,
+use cap_std_ext::cap_std::fs::{
+    DirBuilder, DirBuilderExt as _, OpenOptions, OpenOptionsExt as _, Permissions,
+    PermissionsExt as _,
 };
+use cap_std_ext::cap_tempfile::TempFile;
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use rustix::fs::AtFlags;
 
 /// The default permissions set for directories; we assume
 /// nothing else should be accessing this content.  If you want
@@ -36,28 +35,12 @@ pub(crate) fn default_file_create_options() -> OpenOptions {
     r
 }
 
-/// Given a string, verify it is a single component of a path; it must
-/// not contain `/`.
-pub(crate) fn validate_single_path_component(s: &str) -> Result<()> {
-    anyhow::ensure!(!s.contains('/'));
-    Ok(())
-}
-
 pub(crate) fn parent_nonempty(p: &Path) -> Option<&Path> {
     p.parent().filter(|v| !v.as_os_str().is_empty())
 }
 
-// Just ensures that path is not absolute, so that it can be passed
-// to cap-std APIs.  This makes no attempt
-// to avoid directory escapes like `../` under the assumption
-// that will be handled by a higher level function.
-pub(crate) fn ensure_relative_path(path: &Path) -> &Path {
-    path.strip_prefix("/").unwrap_or(path)
-}
-
 /// Operates on a generic openat fd
 pub(crate) fn ensure_dir(fd: BorrowedFd, p: &Path) -> io::Result<bool> {
-    use rustix::fs::AtFlags;
     let mode = rwx_perms().mode();
     match rustix::fs::mkdirat(fd, p, rustix::fs::Mode::from_raw_mode(mode)) {
         Ok(()) => Ok(true),
@@ -147,19 +130,56 @@ pub(crate) fn reopen_tmpfile_ro(tf: &mut TempFile) -> std::io::Result<()> {
 //     Ok(r)
 // }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn test_relpath() {
-        let expected_foobar = "foo/bar";
-        let cases = [("foo/bar", expected_foobar), ("/foo/bar", expected_foobar)];
-        for (a, b) in cases {
-            assert_eq!(ensure_relative_path(Path::new(a)), Path::new(b));
-        }
-        let idem = ["./foo/bar", "./foo", "./"];
-        for case in idem {
-            assert_eq!(ensure_relative_path(Path::new(case)), Path::new(case));
-        }
+pub(crate) fn linkat_optional_allow_exists(
+    old_dirfd: impl AsFd,
+    old_path: impl AsRef<Path>,
+    new_dirfd: impl AsFd,
+    new_path: impl AsRef<Path>,
+) -> Result<bool> {
+    match rustix::fs::linkat(
+        old_dirfd.as_fd(),
+        old_path.as_ref(),
+        new_dirfd.as_fd(),
+        new_path.as_ref(),
+        AtFlags::empty(),
+    ) {
+        // We successfully linked
+        Ok(()) => Ok(true),
+        // We're idempotent; it's ok if the target already exists
+        Err(e) if e == rustix::io::Errno::EXIST => Ok(true),
+        // Not finding it is just a cache miss
+        Err(e) if e == rustix::io::Errno::NOENT => Ok(false),
+        Err(e) => Err(e.into()),
     }
+}
+
+pub(crate) fn ignore_rustix_eexist(r: rustix::io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e == rustix::io::Errno::EXIST => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn ignore_std_eexist(r: io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn linkat_allow_exists(
+    old_dirfd: impl AsFd,
+    old_path: impl AsRef<Path>,
+    new_dirfd: impl AsFd,
+    new_path: impl AsRef<Path>,
+) -> Result<()> {
+    ignore_rustix_eexist(rustix::fs::linkat(
+        old_dirfd.as_fd(),
+        old_path.as_ref(),
+        new_dirfd.as_fd(),
+        new_path.as_ref(),
+        AtFlags::empty(),
+    ))
 }

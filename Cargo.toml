@@ -30,7 +30,7 @@ hex = "0.4.3"
 serde_json = "1.0.117"
 
 [dev-dependencies]
-similar-asserts = "1"
+similar-asserts = {version = "1", features = ["serde"] }
 tempfile = "3"
 
 [[bin]]
