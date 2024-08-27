@@ -582,10 +582,6 @@ impl RepoTransaction {
     // Commit this transaction, returning statistics
     #[context("Committing")]
     async fn commit(self) -> Result<TransactionStats> {
-        std::process::Command::new("find")
-            .args(["-type", "f"])
-            .cwd_dir(self.repo.0.dir.try_clone()?)
-            .status()?;
         // First, handle the objects
         Self::commit_objects(&self.repo.0.objects, &self.parent.objects).await?;
         // Then all the derived data and links
@@ -1062,7 +1058,7 @@ impl Repo {
             if let Err(_) = send_entries.send(dir_cfs_entry(layers_dir.as_str().into())) {
                 return Ok(());
             }
-            for (i, layer) in manifest_ref.layers().iter().enumerate() {
+            for layer in manifest_ref.layers().iter() {
                 let layer_sha256 = layer.sha256()?;
                 let digest = existing_layers
                     .get(layer.digest())
