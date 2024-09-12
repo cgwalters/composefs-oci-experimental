@@ -31,7 +31,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::fileutils::{
     self, default_dirbuilder, ignore_rustix_eexist, ignore_std_eexist, linkat_allow_exists,
-    linkat_optional_allow_exists,
+    linkat_optional_allow_exists, map_rustix_optional,
 };
 use crate::sha256descriptor::{DescriptorExt, Sha256Hex};
 
@@ -82,7 +82,7 @@ fn object_digest_to_path(objid: ObjectDigest) -> ObjectPath {
 
 fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> ObjectPath {
     // Ensure we are only passed an object id
-    assert_eq!(objid.len(), 64);
+    assert_eq!(objid.len(), 64, "Invalid object ID {objid}");
     objid.insert(2, '/');
     if !prefix.is_empty() && !prefix.ends_with('/') {
         objid.insert(0, '/');
@@ -98,6 +98,15 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     while buf.starts_with("../") {
         buf.replace_range(0..3, "");
     }
+    let objects = "objects/";
+    if buf.starts_with(objects) {
+        buf.replace_range(0..objects.len(), "");
+    }
+    assert_eq!(
+        buf.chars().nth(2).unwrap(),
+        '/',
+        "Expected object file path in {buf}"
+    );
     // Trim the `/`
     buf.replace_range(2..3, "");
     let _ = Sha256Hex::new(buf.as_str());
@@ -381,8 +390,6 @@ impl RepoTransaction {
             let entry = entry?;
 
             let etype = entry.header().entry_type();
-            // Make a copy because it may refer into the header, but we need it
-            // after we process the entry too.
             let path = entry.header().path()?;
             if let Some(parent) = fileutils::parent_nonempty(&path) {
                 fileutils::ensure_dir_recursive(layer_root.as_fd(), parent, true)
@@ -543,9 +550,13 @@ impl RepoTransaction {
     }
 
     fn add_artifact_tag(&self, objid: ObjectDigest, name: &str) -> Result<()> {
-        let objpath = object_digest_to_path(objid);
         let path = artifact_tag_path(name);
-        linkat_allow_exists(&self.repo.0.objects, &objpath, &self.repo.0.dir, &path)?;
+        let target_path = object_digest_to_path_prefixed(objid.clone(), "../../objects");
+        ignore_rustix_eexist(rustix::fs::symlinkat(
+            target_path.as_std_path(),
+            &self.repo.0.dir,
+            path.as_std_path(),
+        ))?;
         Ok(())
     }
 
@@ -558,8 +569,7 @@ impl RepoTransaction {
     ) -> Result<()> {
         // First, spool the file content to a temporary file
         let mut tmpfile = self.new_object()?;
-        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)
-            .with_context(|| format!("Copying tar entry {:?} to tmpfile", path))?;
+        let wrote_size = std::io::copy(&mut entry, &mut tmpfile)?;
         tmpfile.seek(std::io::SeekFrom::Start(0))?;
 
         // Load metadata
@@ -670,8 +680,13 @@ fn cfs_entry_for_descriptor(
 /// Note that the manifest has a descriptor for the config.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Metadata {
+    /// The fsverity object ID for the composefs itself
+    pub objectid: String,
+    /// The descriptor for the manifest.
     pub manifest_descriptor: Descriptor,
+    /// The parsed manifest
     pub manifest: ImageManifest,
+    /// The parsed config
     pub config: ImageConfiguration,
 }
 
@@ -785,10 +800,13 @@ impl Repo {
         digest: Sha256Hex,
     ) -> Result<Option<ObjectDigest>> {
         let path = object_digest_to_path_prefixed(digest.to_string(), OBJECTS_BY_SHA256);
-        let buf = match rustix::fs::readlinkat(&self.0.dir, path.as_std_path(), Vec::new()) {
-            Ok(r) => r,
-            Err(e) if e == rustix::io::Errno::NOENT => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
+            &self.0.dir,
+            path.as_std_path(),
+            Vec::new(),
+        ))?
+        else {
+            return Ok(None);
         };
         let objid = object_link_to_digest(buf.into_bytes())?;
         Ok(Some(objid))
@@ -803,14 +821,29 @@ impl Repo {
     #[context("Reading tag {:?}", tag)]
     pub fn read_artifact_metadata(&self, tag: &str) -> Result<Option<Metadata>> {
         let tagpath = artifact_tag_path(tag);
-        let Some(f) = self.0.dir.open_optional(&tagpath)?.map(|f| f.into_std()) else {
+        let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
+            &self.0.dir,
+            tagpath.as_std_path(),
+            Vec::new(),
+        ))?
+        else {
             return Ok(None);
         };
-        self.read_composefs_metadata(f)
+        let objid = object_link_to_digest(buf.into_bytes())?;
+        let objpath = object_digest_to_path(objid.clone());
+        let Some(f) = self
+            .0
+            .objects
+            .open_optional(&objpath)?
+            .map(|f| f.into_std())
+        else {
+            return Ok(None);
+        };
+        self.read_composefs_metadata(objid, f)
     }
 
     // Parse a composefs file, reading the manifest and config (and layers if they exist)
-    fn read_composefs_metadata(&self, f: File) -> Result<Option<Metadata>> {
+    fn read_composefs_metadata(&self, objid: String, f: File) -> Result<Option<Metadata>> {
         let mut filter = DumpConfig::default();
         filter.filters = Some(&[MANIFEST_NAME, CONFIG_NAME, LAYERS_NAME]);
         let mut manifest: Option<(Descriptor, ImageManifest)> = None;
@@ -899,6 +932,7 @@ impl Repo {
             manifest.ok_or_else(|| anyhow::anyhow!("Missing manifest.json in composefs"))?;
         let config = config.ok_or_else(|| anyhow::anyhow!("Missing config.json in composefs"))?;
         let r = Metadata {
+            objectid: objid,
             manifest_descriptor,
             manifest,
             config,

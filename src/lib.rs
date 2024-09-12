@@ -116,6 +116,8 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             if let Some(meta) = repo.read_artifact_metadata(&name)? {
                 let mut stdout = std::io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &meta)?;
+            } else {
+                println!(r"{{}}");
             }
             Ok(())
         }

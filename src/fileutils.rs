@@ -153,6 +153,19 @@ pub(crate) fn linkat_optional_allow_exists(
     }
 }
 
+pub(crate) fn map_rustix_optional<R>(r: rustix::io::Result<R>) -> rustix::io::Result<Option<R>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            if e == rustix::io::Errno::NOENT {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 pub(crate) fn ignore_rustix_eexist(r: rustix::io::Result<()>) -> Result<()> {
     match r {
         Ok(()) => Ok(()),
