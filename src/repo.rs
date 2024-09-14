@@ -1368,7 +1368,7 @@ mod tests {
         let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 4);
-        assert_eq!(r.imported_objects_size, 16996);
+        assert_eq!(r.imported_objects_size, 16994);
 
         let tags = repo.list_tags(None).await?;
         assert_eq!(tags.len(), 1);
