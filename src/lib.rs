@@ -10,7 +10,6 @@ use ocidir::cap_std;
 mod cli;
 mod fileutils;
 pub mod repo;
-mod sha256descriptor;
 
 /// Options for specifying the repository
 #[derive(Debug, Parser)]
