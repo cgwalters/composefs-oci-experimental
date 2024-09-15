@@ -1283,8 +1283,6 @@ mod tests {
         let repo = Repo::init(&td.open_dir("repo")?, false).unwrap();
         eprintln!("verity={}", repo.has_verity());
 
-        //assert!(!repo.has_layer(EMPTY_DIFFID).unwrap());
-
         // A no-op import
         let txn = repo.new_transaction()?;
         let txn = repo
@@ -1338,6 +1336,7 @@ mod tests {
         let mut blobw = ocidir.create_gzip_layer(Default::default())?;
         blobw.write_all(b"pretend this is a tarball")?;
         let blob = blobw.complete()?;
+        let blobsize = blob.blob.size;
         let mut manifest = ocidir::new_empty_manifest().build().unwrap();
         let mut config = ImageConfigurationBuilder::default().build().unwrap();
         ocidir.push_layer(
@@ -1368,7 +1367,8 @@ mod tests {
         let r = txn.commit().await.unwrap();
         assert_eq!(r.extant_objects_count, 0);
         assert_eq!(r.imported_objects_count, 4);
-        assert_eq!(r.imported_objects_size, 16994);
+        // Can't strictly assert on size as it depends on compression
+        assert_eq!(r.imported_objects_size, 16951 + blobsize);
 
         let tags = repo.list_tags(None).await?;
         assert_eq!(tags.len(), 1);
