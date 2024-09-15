@@ -9,20 +9,23 @@ use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs::Dir;
 use cap_std_ext::cap_tempfile::{TempDir, TempFile};
-use cap_std_ext::cmdext::CapStdExtCommandExt;
 use cap_std_ext::dirext::CapStdExtDirExt;
 use cap_std_ext::{cap_std, cap_tempfile};
 use composefs::dumpfile::{DumpConfig, Entry, Item, Mtime, Xattr};
-use composefs::fsverity::Digest;
+use composefs::fsverity::Digest as VerityDigest;
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
-use ocidir::oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest, MediaType};
+use ocidir::oci_spec::image::{
+    Descriptor, Digest as DescriptorDigest, DigestAlgorithm, ImageConfiguration, ImageManifest,
+    MediaType, Sha256Digest,
+};
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
 use rustix::fs::AtFlags;
@@ -30,11 +33,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::fileutils::{
-    self, default_dirbuilder, ignore_rustix_eexist, ignore_std_eexist, linkat_allow_exists,
+    self, ignore_rustix_eexist, ignore_std_eexist, linkat_allow_exists,
     linkat_optional_allow_exists, map_rustix_optional,
 };
-use crate::sha256descriptor::{DescriptorExt, Sha256Hex};
-
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
@@ -67,7 +68,7 @@ const LAYERS_NAME: &str = "layers";
 /// which has the sha256 for the manifest.json.
 const MANIFEST_SHA256_XATTR: &str = "user.composefs.sha256";
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
-const BY_SHA256_UPLINK: &'static str = "../../";
+const BY_SHA256_UPLINK: &str = "../../";
 
 /// Can be included in a manifest if the digest is pre-computed
 const CFS_DIGEST_ANNOTATION: &str = "composefs.digest";
@@ -75,6 +76,22 @@ const CFS_DIGEST_ANNOTATION: &str = "composefs.digest";
 type SharedObjectDirs = Arc<Mutex<Vec<Dir>>>;
 type ObjectDigest = String;
 type ObjectPath = Utf8PathBuf;
+
+fn sha256_of_descriptor(desc: &Descriptor) -> Result<&str> {
+    desc.as_digest_sha256().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Expected algorithm sha256, found {}",
+            desc.digest().algorithm()
+        )
+    })
+}
+
+fn sha256_of_digest(digest: &DescriptorDigest) -> Result<&str> {
+    if digest.algorithm() != &DigestAlgorithm::Sha256 {
+        anyhow::bail!("Expected algorithm sha256, found {}", digest.algorithm())
+    };
+    Ok(digest.digest())
+}
 
 fn object_digest_to_path(objid: ObjectDigest) -> ObjectPath {
     object_digest_to_path_prefixed(objid, "")
@@ -109,7 +126,10 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     );
     // Trim the `/`
     buf.replace_range(2..3, "");
-    let _ = Sha256Hex::new(buf.as_str());
+    anyhow::ensure!(buf.len() == 64);
+    if !buf.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        anyhow::bail!("Invalid sha256 in object link: {buf}");
+    }
     Ok(buf)
 }
 
@@ -251,13 +271,14 @@ impl<'a> DescriptorWriter<'a> {
         let desc = Descriptor::new(
             media_type,
             self.size.try_into().unwrap(),
-            format!("sha256:{sha256}"),
+            Sha256Digest::from_str(&sha256).unwrap(),
         );
         Ok((desc, tempfile))
     }
 
     #[context("Validating descriptor {}", descriptor.digest())]
-    fn finish_validate(mut self, descriptor: &Descriptor) -> Result<(TempFile<'a>, Sha256Hex)> {
+    fn finish_validate(mut self, descriptor: &Descriptor) -> Result<TempFile<'a>> {
+        let expected_sha256 = sha256_of_descriptor(descriptor)?;
         let descriptor_size: u64 = descriptor.size().try_into()?;
         if descriptor_size != self.size {
             anyhow::bail!(
@@ -266,14 +287,13 @@ impl<'a> DescriptorWriter<'a> {
             );
         }
         let found_sha256 = hex::encode(self.sha256hasher.finish()?);
-        let expected_sha256 = descriptor.sha256()?;
-        if found_sha256 != &*expected_sha256 {
+        if found_sha256 != expected_sha256 {
             anyhow::bail!(
                 "Corrupted object, expected sha256:{expected_sha256} got sha256:{found_sha256}"
             );
         }
         // SAFETY: Nothing else should have taken this value
-        Ok((self.target.take().unwrap(), expected_sha256))
+        Ok(self.target.take().unwrap())
     }
 }
 
@@ -477,7 +497,7 @@ impl RepoTransaction {
             composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
                 .context("Failed to enable fsverity")?;
         };
-        let mut digest = Digest::new();
+        let mut digest = VerityDigest::new();
         composefs::fsverity::fsverity_digest_from_fd(tmpfile.as_file().as_fd(), &mut digest)
             .context("Computing fsverity digest")?;
         let digest = hex::encode(digest.get());
@@ -504,13 +524,11 @@ impl RepoTransaction {
             stats.extant_objects_size += size;
             linkat_allow_exists(&self.parent.objects.as_fd(), objpath, &my_objects, objpath)
                 .with_context(|| format!("Linking extant object {buf}"))?;
-        } else {
-            if !exists_locally {
-                ignore_std_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
-                let mut stats = self.stats.lock().unwrap();
-                stats.imported_objects_count += 1;
-                stats.imported_objects_size += size;
-            }
+        } else if !exists_locally {
+            ignore_std_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
+            let mut stats = self.stats.lock().unwrap();
+            stats.imported_objects_count += 1;
+            stats.imported_objects_size += size;
         }
         let mut buf = buf.into_string();
         buf.remove(2);
@@ -525,10 +543,11 @@ impl RepoTransaction {
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
     ) -> Result<ObjectDigest> {
-        let (tmpf, descriptor_digest) = tmpf.finish_validate(&descriptor)?;
+        let expected_sha256 = sha256_of_descriptor(descriptor)?;
+        let tmpf = tmpf.finish_validate(&descriptor)?;
         let objid = self.import_object(tmpf)?;
         let descriptor_path =
-            object_digest_to_path_prefixed(descriptor_digest.to_string(), OBJECTS_BY_SHA256);
+            object_digest_to_path_prefixed(expected_sha256.to_string(), OBJECTS_BY_SHA256);
         let target_path = object_digest_to_path_prefixed(objid.clone(), BY_SHA256_UPLINK);
         ignore_rustix_eexist(rustix::fs::symlinkat(
             target_path.as_std_path(),
@@ -545,7 +564,7 @@ impl RepoTransaction {
         buf: &[u8],
     ) -> Result<ObjectDigest> {
         let tmpf = self.new_descriptor_with_bytes(buf)?;
-        let tmpf = tmpf.finish_validate(&descriptor)?.0;
+        let tmpf = tmpf.finish_validate(&descriptor)?;
         self.import_object(tmpf)
     }
 
@@ -647,7 +666,7 @@ fn cfs_entry_for_descriptor(
     d: &Descriptor,
     fsverity_digest: &str,
     path: &Utf8Path,
-    sha256: Option<Sha256Hex>,
+    sha256: Option<&str>,
 ) -> Result<Entry<'static>> {
     let size = d.size().try_into()?;
     let item = Item::Regular {
@@ -795,10 +814,7 @@ impl Repo {
     }
 
     #[context("Reading object path of descriptor {digest}")]
-    fn lookup_object_by_descriptor_digest(
-        &self,
-        digest: Sha256Hex,
-    ) -> Result<Option<ObjectDigest>> {
+    fn lookup_object_by_descriptor_digest(&self, digest: &str) -> Result<Option<ObjectDigest>> {
         let path = object_digest_to_path_prefixed(digest.to_string(), OBJECTS_BY_SHA256);
         let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
             &self.0.dir,
@@ -814,8 +830,7 @@ impl Repo {
 
     #[context("Looking up descriptor")]
     fn lookup_descriptor(&self, descriptor: &Descriptor) -> Result<Option<ObjectDigest>> {
-        let descriptor_sha256 = descriptor.sha256()?;
-        self.lookup_object_by_descriptor_digest(descriptor_sha256)
+        self.lookup_object_by_descriptor_digest(sha256_of_descriptor(descriptor)?)
     }
 
     #[context("Reading tag {:?}", tag)]
@@ -900,15 +915,12 @@ impl Repo {
                         .ok_or_else(|| {
                             anyhow::anyhow!("Missing {MANIFEST_SHA256_XATTR} in {MANIFEST_NAME}")
                         })?;
-                    let digest_str = str::from_utf8(&digest_xattr.value)
+                    let digest = str::from_utf8(&digest_xattr.value)
                         .map_err(anyhow::Error::new)
-                        .and_then(Sha256Hex::new)
-                        .context("Parsing {MANIFEST_SHA256_XATTR}")?;
-                    let descriptor = Descriptor::new(
-                        MediaType::ImageManifest,
-                        size.try_into().unwrap(),
-                        digest_str.to_descriptor_digest(),
-                    );
+                        .and_then(|c| Sha256Digest::from_str(c).map_err(Into::into))
+                        .with_context(|| format!("Parsing {MANIFEST_SHA256_XATTR}"))?;
+                    let descriptor =
+                        Descriptor::new(MediaType::ImageManifest, size.try_into().unwrap(), digest);
                     let f = read_object()?;
                     manifest = Some((descriptor, serde_json::from_reader(f)?));
                 }
@@ -918,7 +930,8 @@ impl Repo {
                 }
                 p if p.starts_with(LAYERS_NAME) => {
                     let digest = p.strip_prefix(LAYERS_NAME).unwrap().trim_start_matches('/');
-                    let digest = Sha256Hex::new(digest)?;
+                    let digest = DescriptorDigest::from_str(digest)?;
+                    anyhow::ensure!(digest.algorithm() == &DigestAlgorithm::Sha256);
                     let layers = layers.get_or_insert_with(Default::default);
                     layers.insert(digest.to_string(), fsverity_digest.clone());
                 }
@@ -945,10 +958,9 @@ impl Repo {
         &self,
         txn: RepoTransaction,
         src: File,
-        diffid: &str,
+        diffid: &Sha256Digest,
     ) -> Result<RepoTransaction> {
-        let diffid = Sha256Hex::new(diffid)?;
-        let objid = diffid.to_string();
+        let objid = diffid.digest().to_string();
         let layer_path = object_digest_to_path_prefixed(objid, &format!("{IMAGES}/{LAYERS}"));
         // If we've already fetched the layer, then assume the caller is forcing a re-import
         // to e.g. repair missing files.
@@ -983,12 +995,13 @@ impl Repo {
             .fetch_manifest_raw_oci(&img)
             .await
             .context("Fetching manifest")?;
+        let manifest_digest = DescriptorDigest::from_str(&manifest_digest)?;
+        let manifest_digest_sha256 = sha256_of_digest(&manifest_digest)?.to_string();
         let manifest_descriptor = Descriptor::new(
             MediaType::ImageManifest,
             raw_manifest.len().try_into().unwrap(),
-            &manifest_digest,
+            manifest_digest,
         );
-        let manifest_digest_sha256 = manifest_descriptor.sha256()?;
         let manifest_fsverity = txn
             .import_descriptor_from_bytes(&manifest_descriptor, &raw_manifest)
             .context("Importing manifest")?;
@@ -1000,10 +1013,7 @@ impl Repo {
             v
         } else {
             // Import the config
-            let size: u64 = config_descriptor.size().try_into()?;
-            let (mut config, driver) = proxy
-                .get_blob(&img, config_descriptor.digest(), size)
-                .await?;
+            let (mut config, driver) = proxy.get_descriptor(&img, config_descriptor).await?;
             let config = async move {
                 let mut s = Vec::new();
                 config.read_to_end(&mut s).await?;
@@ -1020,11 +1030,12 @@ impl Repo {
         let (mut existing_layers, to_fetch_layers) = manifest.layers().iter().try_fold(
             (HashMap::new(), HashSet::new()),
             |(mut existing, mut to_fetch), layer| -> Result<_> {
-                layers_by_digest.insert(layer.digest(), layer);
+                let layer_sha256 = sha256_of_descriptor(layer)?;
+                layers_by_digest.insert(layer_sha256, layer);
                 if let Some(objid) = self.lookup_descriptor(layer)? {
-                    existing.insert(layer.digest(), objid);
+                    existing.insert(layer_sha256, objid);
                 } else {
-                    to_fetch.insert(layer.digest());
+                    to_fetch.insert(layer_sha256);
                 }
                 Ok((existing, to_fetch))
             },
@@ -1034,8 +1045,9 @@ impl Repo {
         for layer_digest in to_fetch_layers.iter() {
             // SAFETY: Must exist
             let layer = *layers_by_digest.get(layer_digest).unwrap();
-            let size = layer.size().try_into().context("Invalid size")?;
-            let (blob_reader, driver) = proxy.get_blob(&img, layer.digest(), size).await?;
+            // Must have been validated earlier
+            let layer_sha256 = sha256_of_descriptor(layer).unwrap();
+            let (blob_reader, driver) = proxy.get_descriptor(&img, &layer).await?;
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Clone to move into worker thread
             let layer_copy = layer.clone();
@@ -1048,7 +1060,7 @@ impl Repo {
             let (import_task, driver) = tokio::join!(import_task, driver);
             let _: () = driver?;
             let objid = import_task.unwrap()?;
-            existing_layers.insert(layer.digest(), objid);
+            existing_layers.insert(layer_sha256, objid);
         }
         tracing::debug!("Imported all layers");
 
@@ -1067,7 +1079,7 @@ impl Repo {
         let manifest_ref = &manifest;
         let send_task = async move {
             // If we fail to send on the channel, then we should get an error from the mkcomposefs job
-            if let Err(_) = send_entries.send(dir_cfs_entry("/".into())) {
+            if send_entries.send(dir_cfs_entry("/".into())).is_err() {
                 return Ok(());
             }
             let path = Utf8Path::new("/manifest.json");
@@ -1075,7 +1087,7 @@ impl Repo {
                 &manifest_desc_ref,
                 &manifest_fsverity,
                 path,
-                Some(manifest_digest_sha256),
+                Some(&manifest_digest_sha256),
             )?) {
                 return Ok(());
             }
@@ -1089,15 +1101,18 @@ impl Repo {
                 return Ok(());
             }
             let layers_dir = format!("/{LAYERS_NAME}");
-            if let Err(_) = send_entries.send(dir_cfs_entry(layers_dir.as_str().into())) {
+            if send_entries
+                .send(dir_cfs_entry(layers_dir.as_str().into()))
+                .is_err()
+            {
                 return Ok(());
             }
             for layer in manifest_ref.layers().iter() {
-                let layer_sha256 = layer.sha256()?;
+                let layer_sha256 = sha256_of_descriptor(layer)?;
                 let digest = existing_layers
-                    .get(layer.digest())
+                    .get(layer_sha256)
                     .expect("Should have objid for layer");
-                let path = &format!("/{LAYERS_NAME}/{layer_sha256}");
+                let path = &format!("/{LAYERS_NAME}/sha256:{layer_sha256}");
                 if let Err(_) = send_entries.send(cfs_entry_for_descriptor(
                     &layer,
                     &digest,
@@ -1286,7 +1301,11 @@ mod tests {
         // A no-op import
         let txn = repo.new_transaction()?;
         let txn = repo
-            .import_layer(txn, new_memfd(b"")?, EMPTY_DIFFID)
+            .import_layer(
+                txn,
+                new_memfd(b"")?,
+                &Sha256Digest::from_str(EMPTY_DIFFID).unwrap(),
+            )
             .await
             .unwrap();
         let r = txn.commit().await.unwrap();
@@ -1310,11 +1329,12 @@ mod tests {
         assert!(digest_o.status.success());
         let digest = String::from_utf8(digest_o.stdout).unwrap();
         let digest = digest.split_ascii_whitespace().next().unwrap().trim();
+        let digest = Sha256Digest::from_str(digest).unwrap();
         let testtar = td.open("test.tar")?;
 
         let txn = repo.new_transaction()?;
         let txn = repo
-            .import_layer(txn, testtar.into_std(), digest)
+            .import_layer(txn, testtar.into_std(), &digest)
             .await
             .unwrap();
         txn.commit().await.unwrap();

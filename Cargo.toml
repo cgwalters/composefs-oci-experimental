@@ -7,14 +7,14 @@ resolver = "2"
 [dependencies]
 anyhow = "1.0"
 bincode = { version = "1.3.3" }
-containers-image-proxy = "0.6"
+containers-image-proxy = { git = "https://github.com/cgwalters/containers-image-proxy-rs", branch="bump-oci-spec" }
 #composefs = { version = "0.1.0", features = ["v1_0_4"] }
 composefs = { git = "https://github.com/cgwalters/composefs", branch = "add-read-bindings-simple", version = "0.1.0", features = ["v1_0_4"] }
 cap-std-ext = "4.0"
 camino = "1"
 clap = { version= "4.2", features = ["derive"] }
 fn-error-context = "0.2.0"
-ocidir = { version = "0.2.1" }
+ocidir = { version = "0.3" }
 openssl = "0.10.33"
 rustix = { version = "0.38.34", features = ["fs"] }
 libc = "0.2"
