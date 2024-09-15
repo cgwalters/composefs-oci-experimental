@@ -86,16 +86,6 @@ fn sha256_of_descriptor(desc: &Descriptor) -> Result<&str> {
     })
 }
 
-fn algo_sha256_string_of_descriptor(desc: &Descriptor) -> Result<String> {
-    if desc.digest().algorithm() != &DigestAlgorithm::Sha256 {
-        anyhow::bail!(
-            "Expected algorithm sha256, found {}",
-            desc.digest().algorithm()
-        )
-    };
-    Ok(desc.digest().to_string())
-}
-
 fn sha256_of_digest(digest: &DescriptorDigest) -> Result<&str> {
     if digest.algorithm() != &DigestAlgorithm::Sha256 {
         anyhow::bail!("Expected algorithm sha256, found {}", digest.algorithm())
@@ -1023,9 +1013,7 @@ impl Repo {
             v
         } else {
             // Import the config
-            let size: u64 = config_descriptor.size().try_into()?;
-            let algo_sha256 = algo_sha256_string_of_descriptor(config_descriptor)?;
-            let (mut config, driver) = proxy.get_blob(&img, &algo_sha256, size).await?;
+            let (mut config, driver) = proxy.get_descriptor(&img, config_descriptor).await?;
             let config = async move {
                 let mut s = Vec::new();
                 config.read_to_end(&mut s).await?;
@@ -1059,9 +1047,7 @@ impl Repo {
             let layer = *layers_by_digest.get(layer_digest).unwrap();
             // Must have been validated earlier
             let layer_sha256 = sha256_of_descriptor(layer).unwrap();
-            let algo_sha256 = algo_sha256_string_of_descriptor(layer).unwrap();
-            let size = layer.size().try_into().context("Invalid size")?;
-            let (blob_reader, driver) = proxy.get_blob(&img, &algo_sha256, size).await?;
+            let (blob_reader, driver) = proxy.get_descriptor(&img, &layer).await?;
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Clone to move into worker thread
             let layer_copy = layer.clone();
@@ -1115,7 +1101,10 @@ impl Repo {
                 return Ok(());
             }
             let layers_dir = format!("/{LAYERS_NAME}");
-            if send_entries.send(dir_cfs_entry(layers_dir.as_str().into())).is_err() {
+            if send_entries
+                .send(dir_cfs_entry(layers_dir.as_str().into()))
+                .is_err()
+            {
                 return Ok(());
             }
             for layer in manifest_ref.layers().iter() {

@@ -1,14 +1,16 @@
-use std::ffi::OsString;
+use std::{borrow::Cow, ffi::OsString, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use camino::Utf8PathBuf;
 
 use cap_std::fs::Dir;
 use clap::Parser;
+use comfy_table::Cell;
 use ocidir::cap_std;
 
 mod cli;
 mod fileutils;
+mod ociutil;
 pub mod repo;
 
 /// Options for specifying the repository
@@ -105,9 +107,47 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
         }
         Opt::List(opts) => {
             let repo = opts.open()?;
+            let now = chrono::Utc::now();
+            let mut table = comfy_table::Table::new();
+            table.set_header(vec!["NAME", "TYPE", "CREATED", "SIZE"]);
             for tag in repo.list_tags(None).await? {
-                println!("{tag}");
+                let metadata = repo
+                    .read_artifact_metadata(&tag)?
+                    .ok_or_else(|| anyhow!("Expected metadata for {tag}"))?;
+                let ty = metadata
+                    .manifest
+                    .artifact_type()
+                    .as_ref()
+                    .map(|c| c.as_ref())
+                    .unwrap_or("image");
+                let created_delta = ociutil::created(&metadata.manifest, &metadata.config)
+                    .and_then(|c| chrono::DateTime::parse_from_rfc3339(c).ok())
+                    .map(|c| now.signed_duration_since(&c));
+                let created = if let Some(delta) = created_delta {
+                    if delta < chrono::Duration::zero() {
+                        Cow::Borrowed("in the future")
+                    } else {
+                        if let Ok(delta) = delta.abs().to_std() {
+                            Cow::Owned(format!("{} ago", indicatif::HumanDuration(delta)))
+                        } else {
+                            Cow::Borrowed("<invalid timestamp>")
+                        }
+                    }
+                } else {
+                    Cow::Borrowed("unknown")
+                };
+                let size = metadata
+                    .manifest
+                    .layers()
+                    .iter()
+                    .fold(0u64, |mut acc, layer| {
+                        acc += layer.size() as u64;
+                        acc
+                    });
+                let size = indicatif::HumanBytes(size);
+                table.add_row([Cell::new(tag.as_str()), Cell::new(created), Cell::new(size)]);
             }
+            println!("{table}");
             Ok(())
         }
         Opt::Inspect { repo_opts, name } => {
