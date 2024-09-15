@@ -28,6 +28,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 hex = "0.4.3"
 serde_json = "1.0.117"
+comfy-table = "7.1.1"
+chrono = "0.4.38"
+indicatif = "0.17.8"
 
 [dev-dependencies]
 similar-asserts = {version = "1", features = ["serde"] }

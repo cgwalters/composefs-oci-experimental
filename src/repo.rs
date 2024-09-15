@@ -709,6 +709,18 @@ pub struct Metadata {
     pub config: ImageConfiguration,
 }
 
+impl Metadata {
+    /// Media type of the artifact; if artifactType is set, it will be used.
+    /// Otherwise, the type of an OCI image config will be returned.
+    pub fn artifact_type(&self) -> &str {
+        self.manifest
+            .artifact_type()
+            .as_ref()
+            .map(|c| c.as_ref())
+            .unwrap_or_else(|| self.manifest.config().media_type().as_ref())
+    }
+}
+
 #[derive(Debug)]
 struct RepoInner {
     dir: Dir,
