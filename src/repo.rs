@@ -869,6 +869,11 @@ impl Repo {
         self.read_composefs_metadata(objid, f)
     }
 
+    pub fn require_artifact_metadata(&self, tag: &str) -> Result<Metadata> {
+        self.read_artifact_metadata(tag)?
+            .ok_or_else(|| anyhow::anyhow!("No such tag: {tag}"))
+    }
+
     // Parse a composefs file, reading the manifest and config (and layers if they exist)
     fn read_composefs_metadata(&self, objid: String, f: File) -> Result<Option<Metadata>> {
         let mut filter = DumpConfig::default();
@@ -963,6 +968,13 @@ impl Repo {
             config,
         };
         Ok(Some(r))
+    }
+
+    /// Return true if this layer already exists in unpacked form.
+    fn has_unpacked_layer(&self, diffid: &DescriptorDigest) -> Result<bool> {
+        let objid = sha256_of_digest(diffid)?.to_string();
+        let layer_path = object_digest_to_path_prefixed(objid, &format!("{IMAGES}/{LAYERS}"));
+        self.0.dir.try_exists(&layer_path).map_err(Into::into)
     }
 
     #[context("Importing layer")]
@@ -1150,6 +1162,47 @@ impl Repo {
         Ok((txn, manifest_descriptor))
     }
 
+    /// Ensure that a downloaded OCI image is "expanded" (unpacked)
+    /// into the composefs-native store.
+    pub async fn unpack(
+        &self,
+        mut txn: RepoTransaction,
+        imgref: &str,
+    ) -> Result<(RepoTransaction, Descriptor)> {
+        let meta = self.require_artifact_metadata(&imgref)?;
+        match meta.artifact_type() {
+            o if o == ocidir::oci_spec::image::MediaType::ImageConfig.as_ref() => {}
+            o => anyhow::bail!("Unhandled media type: {o}"),
+        };
+
+        // Walk the diffids, and find the ones we don't already have
+        let needed_diffs = meta.manifest.layers().iter().enumerate().try_fold(
+            Vec::new(),
+            |mut acc, (i, layer)| -> Result<_> {
+                let diffid = meta
+                    .config
+                    .rootfs()
+                    .diff_ids()
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("Missing diffid {i}"))?;
+                let diffid = DescriptorDigest::from_str(&diffid)?;
+
+                if !self.has_unpacked_layer(&diffid)? {
+                    tracing::debug!("Need diff: {diffid}");
+                    acc.push((layer, diffid));
+                }
+                Ok(acc)
+            },
+        )?;
+
+        for (layer, diffid) in needed_diffs {
+            let srcf = File::open("/dev/null")?;
+            let sha256 = sha256_of_digest(diffid)?;
+            txn = self.import_layer(txn, srcf, diffid).await?;
+        }
+        Ok(txn)
+    }
+
     pub async fn list_tags(&self, starting_with: Option<&str>) -> Result<Vec<String>> {
         let repo = Arc::clone(&self.0);
         let starting_with = starting_with.map(|s| s.to_string());
@@ -1172,71 +1225,6 @@ impl Repo {
         })
         .await
         .unwrap()
-    }
-
-    /// Ensure that a downloaded OCI image is "expanded" (unpacked)
-    /// into the composefs-native store.
-    pub async fn expand(&self, _manifest_desc: &Descriptor) -> Result<TransactionStats> {
-        todo!()
-        // let repo = self.clone();
-        // let manifest_desc = manifest_desc.clone();
-        // // Read and parse the manifest in a helper thread, also retaining its fd
-        // let (manifest_fd, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
-        //     let mut bufr = repo
-        //         .as_oci()
-        //         .read_blob(&manifest_desc)
-        //         .map(BufReader::new)?;
-        //     let parsed = serde_json::from_reader::<_, ImageManifest>(&mut bufr)?;
-        //     let mut f = bufr.into_inner();
-        //     f.seek(std::io::SeekFrom::Start(0))?;
-        //     Ok((f, parsed))
-        // })
-        // .await
-        // .unwrap()
-        // .context("Reading manifest")?;
-        // // Read and parse the config in a helper thread
-        // let repo = self.clone();
-        // let config = manifest.config().clone();
-        // let config: ImageConfiguration = tokio::task::spawn_blocking(move || -> Result<_> {
-        //     repo.as_oci().read_json_blob(&config)
-        // })
-        // .await
-        // .unwrap()?;
-
-        // // Walk the diffids, and find the ones we don't already have
-        // let needed_diffs = manifest.layers().iter().enumerate().try_fold(
-        //     Vec::new(),
-        //     |mut acc, (i, layer)| -> Result<_> {
-        //         let diffid = config
-        //             .rootfs()
-        //             .diff_ids()
-        //             .get(i)
-        //             .ok_or_else(|| anyhow::anyhow!("Missing diffid {i}"))?;
-        //         let diffid = DigestSha256::parse(&diffid)?;
-        //         if !self.has_layer(diffid.sha256())? {
-        //             acc.push((layer, diffid));
-        //         }
-        //         Ok(acc)
-        //     },
-        // )?;
-
-        // let mut stats = ImportLayerStats::default();
-        // for (layer, diffid) in needed_diffs {
-        //     let blobsrc = self.as_oci().read_blob(layer)?;
-        //     stats = stats + self.import_layer(blobsrc, diffid.sha256()).await?;
-        // }
-
-        // if let Some(expected_digest) = manifest
-        //     .annotations()
-        //     .as_ref()
-        //     .and_then(|a| a.get(CFS_DIGEST_ANNOTATION))
-        // {
-        //     // Handle verified manifests later
-        //     todo!()
-        // } else {
-        // }
-
-        // Ok(stats)
     }
 
     // Commit this transaction, returning statistics
