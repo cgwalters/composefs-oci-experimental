@@ -130,6 +130,8 @@ pub(crate) fn reopen_tmpfile_ro(tf: &mut TempFile) -> std::io::Result<()> {
 //     Ok(r)
 // }
 
+/// Create a hard link. If the link was successfully created *or* the target already exists, return `Ok(true)`.
+/// If the *source* doesn't exist, return `Ok(false)`. Otherwise, an error is returned.
 pub(crate) fn linkat_optional_allow_exists(
     old_dirfd: impl AsFd,
     old_path: impl AsRef<Path>,
@@ -153,6 +155,7 @@ pub(crate) fn linkat_optional_allow_exists(
     }
 }
 
+/// Given a result, return `None` if the error is "file not found".
 pub(crate) fn map_rustix_optional<R>(r: rustix::io::Result<R>) -> rustix::io::Result<Option<R>> {
     match r {
         Ok(v) => Ok(Some(v)),
@@ -166,33 +169,12 @@ pub(crate) fn map_rustix_optional<R>(r: rustix::io::Result<R>) -> rustix::io::Re
     }
 }
 
-pub(crate) fn ignore_rustix_eexist(r: rustix::io::Result<()>) -> Result<()> {
-    match r {
-        Ok(()) => Ok(()),
-        Err(e) if e == rustix::io::Errno::EXIST => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-pub(crate) fn ignore_std_eexist(r: io::Result<()>) -> Result<()> {
+/// Given a result, ignore a "file already exists" error and instead consider it as success.
+pub(crate) fn ignore_eexist(r: io::Result<()>) -> Result<()> {
+    let r = r.into();
     match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(e.into()),
     }
-}
-
-pub(crate) fn linkat_allow_exists(
-    old_dirfd: impl AsFd,
-    old_path: impl AsRef<Path>,
-    new_dirfd: impl AsFd,
-    new_path: impl AsRef<Path>,
-) -> Result<()> {
-    ignore_rustix_eexist(rustix::fs::linkat(
-        old_dirfd.as_fd(),
-        old_path.as_ref(),
-        new_dirfd.as_fd(),
-        new_path.as_ref(),
-        AtFlags::empty(),
-    ))
 }

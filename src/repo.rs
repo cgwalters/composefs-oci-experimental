@@ -32,10 +32,7 @@ use rustix::fs::AtFlags;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
-use crate::fileutils::{
-    self, ignore_rustix_eexist, ignore_std_eexist, linkat_allow_exists,
-    linkat_optional_allow_exists, map_rustix_optional,
-};
+use crate::fileutils::{self, ignore_eexist, linkat_optional_allow_exists, map_rustix_optional};
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
@@ -337,7 +334,7 @@ async fn merge_dir_to(from: Dir, to: Dir) -> Result<u64> {
                 let f = from.open(&name)?;
                 f.sync_all().context("fsync")?;
             }
-            ignore_rustix_eexist(rustix::fs::renameat(from, &name, &to, &name))?;
+            ignore_eexist(rustix::fs::renameat(from, &name, &to, &name).map_err(|e| e.into()))?;
             Ok(())
         });
     }
@@ -522,10 +519,19 @@ impl RepoTransaction {
             let mut stats = self.stats.lock().unwrap();
             stats.extant_objects_count += 1;
             stats.extant_objects_size += size;
-            linkat_allow_exists(&self.parent.objects.as_fd(), objpath, &my_objects, objpath)
-                .with_context(|| format!("Linking extant object {buf}"))?;
+            ignore_eexist(
+                rustix::fs::linkat(
+                    &self.parent.objects.as_fd(),
+                    objpath,
+                    &my_objects,
+                    objpath,
+                    AtFlags::empty(),
+                )
+                .map_err(|e| e.into()),
+            )
+            .with_context(|| format!("Linking extant object {buf}"))?;
         } else if !exists_locally {
-            ignore_std_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
+            ignore_eexist(tmpfile.replace(&buf)).context("tmpfile replace")?;
             let mut stats = self.stats.lock().unwrap();
             stats.imported_objects_count += 1;
             stats.imported_objects_size += size;
@@ -549,11 +555,14 @@ impl RepoTransaction {
         let descriptor_path =
             object_digest_to_path_prefixed(expected_sha256.to_string(), OBJECTS_BY_SHA256);
         let target_path = object_digest_to_path_prefixed(objid.clone(), BY_SHA256_UPLINK);
-        ignore_rustix_eexist(rustix::fs::symlinkat(
-            target_path.as_std_path(),
-            &self.repo.0.dir,
-            descriptor_path.as_std_path(),
-        ))?;
+        ignore_eexist(
+            rustix::fs::symlinkat(
+                target_path.as_std_path(),
+                &self.repo.0.dir,
+                descriptor_path.as_std_path(),
+            )
+            .map_err(|e| e.into()),
+        )?;
         Ok(objid)
     }
 
@@ -571,11 +580,14 @@ impl RepoTransaction {
     fn add_artifact_tag(&self, objid: ObjectDigest, name: &str) -> Result<()> {
         let path = artifact_tag_path(name);
         let target_path = object_digest_to_path_prefixed(objid.clone(), "../../objects");
-        ignore_rustix_eexist(rustix::fs::symlinkat(
-            target_path.as_std_path(),
-            &self.repo.0.dir,
-            path.as_std_path(),
-        ))?;
+        ignore_eexist(
+            rustix::fs::symlinkat(
+                target_path.as_std_path(),
+                &self.repo.0.dir,
+                path.as_std_path(),
+            )
+            .map_err(|e| e.into()),
+        )?;
         Ok(())
     }
 
