@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, Seek, Write};
-use std::ops::Add;
+use std::ops::{Add, ControlFlow};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt as _;
@@ -116,18 +116,14 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     if buf.starts_with(objects) {
         buf.replace_range(0..objects.len(), "");
     }
-    assert_eq!(
-        buf.chars().nth(2).unwrap(),
-        '/',
-        "Expected object file path in {buf}"
-    );
+    if !matches!(buf.chars().nth(2), Some('/')) {
+        anyhow::bail!("Expected object file path in {buf:?}");
+    }
     // Trim the `/`
     buf.replace_range(2..3, "");
-    anyhow::ensure!(buf.len() == 64);
-    if !buf.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
-        anyhow::bail!("Invalid sha256 in object link: {buf}");
-    }
-    Ok(buf)
+    // TODO avoid multiple allocations here
+    let r = Sha256Digest::from_str(&buf)?;
+    Ok(r.digest().into())
 }
 
 fn artifact_tag_path(name: &str) -> Utf8PathBuf {
@@ -479,6 +475,13 @@ impl RepoTransaction {
         Ok(())
     }
 
+    fn fsverity_hexdigest_from_fd(fd: BorrowedFd) -> Result<String> {
+        let mut digest = VerityDigest::new();
+        composefs::fsverity::fsverity_digest_from_fd(fd, &mut digest)
+            .context("Computing fsverity digest")?;
+        Ok(hex::encode(digest.get()))
+    }
+
     #[context("Importing object")]
     fn import_object(&self, mut tmpfile: TempFile) -> Result<ObjectDigest> {
         // Rewind to ensure we read from the start
@@ -494,10 +497,8 @@ impl RepoTransaction {
             composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
                 .context("Failed to enable fsverity")?;
         };
-        let mut digest = VerityDigest::new();
-        composefs::fsverity::fsverity_digest_from_fd(tmpfile.as_file().as_fd(), &mut digest)
+        let digest = Self::fsverity_hexdigest_from_fd(tmpfile.as_file().as_fd())
             .context("Computing fsverity digest")?;
-        let digest = hex::encode(digest.get());
         let mut buf = digest.clone();
         buf.insert(2, '/');
         let buf = Utf8PathBuf::from(buf);
@@ -721,6 +722,14 @@ pub struct Metadata {
     pub config: ImageConfiguration,
 }
 
+/// Repository corruption was detected
+pub enum CorruptionEvent {
+    /// A fsverity object was corrupted
+    FsVerity(Box<str>),
+    /// An unexpected error occurred
+    InternalError(Box<str>),
+}
+
 #[derive(Debug)]
 struct RepoInner {
     dir: Dir,
@@ -845,32 +854,51 @@ impl Repo {
         self.lookup_object_by_descriptor_digest(sha256_of_descriptor(descriptor)?)
     }
 
-    #[context("Reading tag {:?}", tag)]
-    pub fn read_artifact_metadata(&self, tag: &str) -> Result<Option<Metadata>> {
-        let tagpath = artifact_tag_path(tag);
-        let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
-            &self.0.dir,
-            tagpath.as_std_path(),
-            Vec::new(),
-        ))?
-        else {
-            return Ok(None);
-        };
-        let objid = object_link_to_digest(buf.into_bytes())?;
-        let objpath = object_digest_to_path(objid.clone());
-        let Some(f) = self
-            .0
-            .objects
-            .open_optional(&objpath)?
-            .map(|f| f.into_std())
-        else {
-            return Ok(None);
-        };
-        self.read_composefs_metadata(objid, f)
+    #[context("Looking up descriptor")]
+    fn require_descriptor(&self, descriptor: &Descriptor) -> Result<ObjectDigest> {
+        self.lookup_object_by_descriptor_digest(sha256_of_descriptor(descriptor)?)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Missing object for descriptor: {}", descriptor.digest())
+            })
+    }
+
+    #[context("Reading tag {tag}")]
+    pub async fn read_artifact_metadata(&self, tag: &str) -> Result<Option<Metadata>> {
+        let repo = Arc::clone(&self.0);
+        let tag = tag.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let tagpath = artifact_tag_path(&tag);
+            let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
+                &repo.dir,
+                tagpath.as_std_path(),
+                Vec::new(),
+            ))?
+            else {
+                return Ok(None);
+            };
+            let objid = object_link_to_digest(buf.into_bytes())?;
+            let objpath = object_digest_to_path(objid.clone());
+            let Some(f) = repo.objects.open_optional(&objpath)?.map(|f| f.into_std()) else {
+                return Ok(None);
+            };
+            Self::read_composefs_metadata(&repo, objid, f)
+        })
+        .await?
+    }
+
+    #[context("Reading tag {tag}")]
+    pub async fn require_artifact_metadata(&self, tag: &str) -> Result<Metadata> {
+        self.read_artifact_metadata(tag)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("No such tag {tag}"))
     }
 
     // Parse a composefs file, reading the manifest and config (and layers if they exist)
-    fn read_composefs_metadata(&self, objid: String, f: File) -> Result<Option<Metadata>> {
+    fn read_composefs_metadata(
+        repo: &RepoInner,
+        objid: String,
+        f: File,
+    ) -> Result<Option<Metadata>> {
         let mut filter = DumpConfig::default();
         filter.filters = Some(&[MANIFEST_NAME, CONFIG_NAME, LAYERS_NAME]);
         let mut manifest: Option<(Descriptor, ImageManifest)> = None;
@@ -906,7 +934,7 @@ impl Repo {
 
             let objpath = object_digest_to_path(fsverity_digest.clone());
             let read_object = || {
-                let r = self.0.objects.open(&objpath)?.into_std();
+                let r = repo.objects.open(&objpath)?.into_std();
                 // Before we return let's sanity check this since it's cheap to do
                 let meta = r.metadata()?;
                 if meta.size() != size {
@@ -998,7 +1026,7 @@ impl Repo {
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
     ) -> Result<(RepoTransaction, Descriptor)> {
-        if let Some(meta) = self.read_artifact_metadata(imgref)? {
+        if let Some(meta) = self.read_artifact_metadata(imgref).await? {
             return Ok((txn, meta.manifest_descriptor));
         }
 
@@ -1174,6 +1202,80 @@ impl Repo {
         .unwrap()
     }
 
+    fn fsck_one_object(&self, objid: &str) -> Result<Option<CorruptionEvent>> {
+        let path = object_digest_to_path(objid.to_string());
+        let f = self.0.objects.open(&path)?;
+        let found_digest = RepoTransaction::fsverity_hexdigest_from_fd(f.as_fd())?;
+        let r = if found_digest != objid {
+            Some(CorruptionEvent::FsVerity(objid.into()))
+        } else {
+            None
+        };
+        Ok(r)
+    }
+
+    /// Verify integrity of all objects; a callback is invoked for each corrupted object
+    /// or when an unexpected other error is encountered.
+    ///
+    /// The total count of all verified objects is returned.
+    pub async fn fsck<F>(&self, mut f: F) -> Result<u64>
+    where
+        F: FnMut(CorruptionEvent) -> ControlFlow<()>,
+    {
+        let mut n_verified = 0u64;
+        let tags = self.list_tags(None).await?;
+        for tag in tags {
+            let metadata = self.require_artifact_metadata(&tag).await?;
+            for desc in metadata.manifest.layers() {
+                let expected_digest = self.require_descriptor(desc)?;
+                if let Some(event) = self.fsck_one_object(&expected_digest)? {
+                    match f(event) {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(()) => {
+                            return Ok(n_verified);
+                        }
+                    }
+                } else {
+                    n_verified += 1;
+                }
+            }
+        }
+        Ok(n_verified)
+    }
+
+    /// Verify integrity of all objects. The total count of all verified
+    /// objects is returned.
+    pub async fn fsck_simple(&self) -> Result<u64> {
+        let mut n_corrupted = 0u64;
+        let mut err = None;
+        let r = self
+            .fsck(|event| {
+                match event {
+                    CorruptionEvent::FsVerity(_) => {
+                        n_corrupted += 1;
+                    }
+                    CorruptionEvent::InternalError(msg) => {
+                        err = Some(msg);
+                        return ControlFlow::Break(());
+                    }
+                }
+                ControlFlow::Continue(())
+            })
+            .await?;
+        match (err, n_corrupted) {
+            (Some(e), 0) => {
+                anyhow::bail!("{e}");
+            }
+            (Some(e), n) => {
+                anyhow::bail!("corrupted objects: {n}, and encountered error: {e}");
+            }
+            (None, 0) => Ok(r),
+            (None, n) => {
+                anyhow::bail!("corruption detected");
+            }
+        }
+    }
+
     /// Ensure that a downloaded OCI image is "expanded" (unpacked)
     /// into the composefs-native store.
     pub async fn expand(&self, _manifest_desc: &Descriptor) -> Result<TransactionStats> {
@@ -1293,6 +1395,21 @@ mod tests {
 
     const EMPTY_DIFFID: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+    #[test]
+    fn test_object_link_to_digest() {
+        let failing = &["", "foo", "../../blah"];
+        for case in failing {
+            assert!(object_link_to_digest(case.as_bytes().into()).is_err());
+        }
+        assert_eq!(
+            object_link_to_digest(
+                b"../../e3/b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into()
+            )
+            .unwrap(),
+            EMPTY_DIFFID
+        );
+    }
+
     fn new_memfd(buf: &[u8]) -> Result<File> {
         use rustix::fs::MemfdFlags;
         let f: File = rustix::fs::memfd_create("test memfd", MemfdFlags::CLOEXEC)?.into();
@@ -1406,8 +1523,12 @@ mod tests {
         assert_eq!(tags.len(), 1);
         similar_asserts::assert_eq!(tags[0].as_str(), imgref);
 
-        let found_desc = repo.read_artifact_metadata(&imgref).unwrap().unwrap();
+        let found_desc = repo.read_artifact_metadata(&imgref).await.unwrap().unwrap();
         assert_eq!(&found_desc.manifest_descriptor, &desc);
+
+        // TODO fix fsck to also verify metadata
+        let n = repo.fsck_simple().await?;
+        assert_eq!(n, 1);
 
         Ok(())
     }
