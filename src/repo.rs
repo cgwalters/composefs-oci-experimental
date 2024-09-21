@@ -33,6 +33,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 use crate::fileutils::{self, ignore_eexist, linkat_optional_allow_exists, map_rustix_optional};
+
+/// Maximum length of a tag name
+const TAG_MAX: usize = 255;
+
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
@@ -74,15 +78,12 @@ type SharedObjectDirs = Arc<Mutex<Vec<Dir>>>;
 type ObjectDigest = String;
 type ObjectPath = Utf8PathBuf;
 
+/// Require that a descriptor's digest is sha256. Return the digest value.
 fn sha256_of_descriptor(desc: &Descriptor) -> Result<&str> {
-    desc.as_digest_sha256().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Expected algorithm sha256, found {}",
-            desc.digest().algorithm()
-        )
-    })
+    sha256_of_digest(desc.digest())
 }
 
+/// Require that a descriptor digest is sha256. Return the digest value.
 fn sha256_of_digest(digest: &DescriptorDigest) -> Result<&str> {
     if digest.algorithm() != &DigestAlgorithm::Sha256 {
         anyhow::bail!("Expected algorithm sha256, found {}", digest.algorithm())
@@ -90,10 +91,13 @@ fn sha256_of_digest(digest: &DescriptorDigest) -> Result<&str> {
     Ok(digest.digest())
 }
 
+/// Given an object ID (sha256 digest), turn it into a path. A slash `/`
+/// is inserted after the first two characters.
 fn object_digest_to_path(objid: ObjectDigest) -> ObjectPath {
     object_digest_to_path_prefixed(objid, "")
 }
 
+/// Like [`object_digest_to_path()`] but also insert the provided prefix.
 fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> ObjectPath {
     // Ensure we are only passed an object id
     assert_eq!(objid.len(), 64, "Invalid object ID {objid}");
@@ -105,6 +109,11 @@ fn object_digest_to_path_prefixed(mut objid: ObjectDigest, prefix: &str) -> Obje
     objid.into()
 }
 
+/// Convert a relative path into an object identifier. For convenience/comprehensibility
+/// things like tags are implemented as symbolic links to an object. But often we
+/// want to precisely know which object is expected, and not just follow the link.
+///
+/// This trims all relative path components (`../`) as well as an `objects/` string.
 #[context("Parsing object link")]
 fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     // It's an error if we find non-UTF8 content here
@@ -126,7 +135,10 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     Ok(r.digest().into())
 }
 
+/// Given a tag name (arbitrary string), encode it in a way that is safe for a filename
+/// and prepend the tag directory to it.
 fn artifact_tag_path(name: &str) -> Utf8PathBuf {
+    assert!(name.len() <= TAG_MAX);
     let tag_filename =
         percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
     format!("{ARTIFACTS}/{TAGS}/{tag_filename}").into()
