@@ -8,6 +8,15 @@ OCI artifacts too.
 This crate is intended to be the successor to
 the "storage core" of both ostree and containers/storage.
 
+## Goal: efficient and complete chained fsverity-oriented OCI image
+
+For more on this, see https://github.com/containers/storage/issues/2095
+
+Basically the goal is to create efficient fsverity (composefs) oriented
+storage layout such that a `manifest.json` (which points to everything
+else, such as the `config.json` and especially the layers) can
+be efficiently mounted and verified (incrementally/on-demand or upfront).
+
 ## Design
 
 The composefs core just offers the primitive of creating
@@ -26,69 +35,91 @@ By default, a cfs-oci image is a bit like a generic
 in that it does not automatically unpack layers,
 but stores content directly.
 
+An image is represented as a directory.
+
+There are 2-3 default files in an image directory.
+
+- `manifest.json`: The manifest file; a hard link to the object store
+- `config.json`: The image configuration; hard link to the object store
+- `manifest-cfs-local.json`: Only present for an image without precomputed composefs annotations (see below).
+
+### Generic artifact components
+
+For a generic OCI artifact, there is one additional sub-directory:
+
+- `layers/<digest>`: A directory with an entry for each layer (blob) named by its descriptor digest.
+
+### image.cfs for an unpacked OCI image
+
+- `diffs/<digest>.tar-split`: The "tar split" metadata for this image that provides
+   sufficient metadata to reconstruct the tar stream corresponding to the diffid.
+- `rootfs.cfs`: A mountable composefs with the complete merged root filesystem.
+
+### Combined artifact and unpacked
+
+An image can be both an artifact *and* unpacked, i.e. both the compressed
+layer tarballs and the final merged rootfs are stored. This can be useful
+when one needs to be able to reliably re-push the full contents of an
+image "bit for bit" (including compression), but also be able to
+mount and inspect it.
+
 ### cfs-oci native annotations
 
-This project defines a annotation
-`containers.composefs.fsverity` that is the composefs
-fsverity-sha256 (as opposed to the default "content-sha256")
-that can be applied to a descriptor.
+#### The `containers.composefs.fsverity` annotation
 
-Additionally, a `containers.composefs.layer.fsverity` annotation
+The annotation `containers.composefs.fsverity` is the composefs
+fsverity sha256 (as opposed to the default "content-sha256")
+that can be applied to a [descriptor](https://github.com/opencontainers/image-spec/blob/main/descriptor.md).
+
+#### The `containers.composefs.layer.digest` annotation
+
+The `containers.composefs.layer.digest` annotation
 can be added to `application/vnd.oci.image.layer.v1.tar` or one
 of its "sub-types" such as `application/vnd.oci.image.layer.v1.tar+gzip`.
-This digest holds the "canonical composefs tar fsverity" digest of
-the tarball mapped to an EROFS image.
+This digest holds the "canonical composefs EROFS" digest of
+the tarball mapped to an EROFS image. Consider this like a variant
+of the "diffid" that instead allows efficient indexed access
+to the changeset corresponding to a layer because a composefs
+can be mounted instead.
 
 When these annotations are pre-computed by a build server,
 the signature covering the manifest hence covers both the
 default "content-sha256:" digest as well as the optimized
-`fsverity-sha256` digest.
+fsverity digests.
 
-An image 
+#### The `containers.composefs.rootfs.digest` annotation
 
-### Non-native images
+An image manifest should additionally have a `containers.composefs.rootfs.digest` annotation that contains the digest of the final flattened
+image following the [applying changesets](https://github.com/opencontainers/image-spec/blob/main/layer.md#applying-changesets)
+algorithm for all of its layers.
 
-An image that does not already have these annotations can
-be imported; they will be computed client side and stored
-as extended attributes instead. Each file stored in the
-`blobs/sha256` directory will have a
-`trusted.composefs.fsverity` xattr (when run as root,
-otherwise `user.composefs.fsverity`). In order to
-be robust against accidental corruption,
-the value is actually a [HMAC](https://en.wikipedia.org/wiki/HMAC)
-using the manifest's digest as a key.
+Note that computing this digest can be computed relatively cheaply assuming that the system has a cached composefs image corresponding to each layer (it will not involve recomputing the digest of content files).
 
-Additionally, the manifest will have a `trusted.composefs.`
+This digest must match that for `rootfs.cfs`.
 
-OCI artifacts are more general, and are effectively
+### Unannotated images
 
-```
-/manifest.json
-/config.json
-/layers/[0..n]
-```
-
-where each file in `layers/` is directory stored as a composefs
-object.
+An image that does not already have these annotations 
+as part of the `manifest.json` can still be imported. 
+The modified manifest will be stored as `manifest-local-cfs.json` alongside
+the `manifest.json`. In order to be robust against accidental corruption,
+(strongly tying the modified manifest to its original), the two
+manifests are cross-linked via extended attributes. On the original
+manifest, an extended attribute `trusted.composefs.manifest-local-cfs.fsverity`
+will contain the fsverity digest of the `manifest-local-cfs.json`.
+An extended attribute `trusted.composefs.manifest.fsverity` is part of the `manifest-local-cfs.json`.
 
 ### Layout
 
-A cfs-ocidir has the following toplevel entries:
+A cfs-ocidir can contain multiple images, and includes its own metadata.
+It has the following layout:
 
 - `meta.json`: Metadata
 - `objects/`: A "split-digest" object directory, used as the shared backing store for all composefs files.
    The digest here is the fsverity digest.
-- `objects/by-sha256`: A split-digest directory with hardlinks to objects named by their "plain" sha256. Note
-   that not *every* object has its plain sha256 calculated.
-- `artifacts/`: A directory for OCI artifacts, filled with composefs files, named by their fsverity digest (split-digest)
-- `artifacts/tags`: A directory with hard links to `artifacts/`, with the file name being a URL encoding of the artifact name
-- `images/`: A directory for OCI images (not generic artifacts) filled with composefs files (backed by `objects/`), named by their fsverity digest
-- `images/tags/`: A directory of hard links to `images/`, with the file name being a URL encoding of the image name
-- `images/layers/`: A directory filled with composefs files (backed by `objects/`), named by their "diffid" (sha256, split-digest)
-   Each composefs file has a set of xattrs `user.composefs.blobid.0..n` where each value is the sha256 digest
-   of a corresponding compressed tar stream.
-
-Note that an artifact may *also* be an OCI image; it is not required to store OCI images "unpacked".
+- `images/`: A directory for OCI images, named by their manifest sha256 digest.
+- `images/tags`: A directory with symbolic links to `images/`, with the file name being a URL encoding of
+   the tag.
 
 #### "split-digest" format
 

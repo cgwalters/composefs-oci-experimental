@@ -41,33 +41,45 @@ const TAG_MAX: usize = 255;
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
 const OBJECTS: &str = "objects";
-/// A split-checksum hardlink set into OBJECTS
-const OBJECTS_BY_SHA256: &str = "objects/by-sha256";
-/// OCI container images, stored in a ready-to-run format
+/// OCI images, may be either packed (or an artifact) or "unpacked"
 const IMAGES: &str = "images";
-/// A subdirectory of images/ or artifacts/, hardlink farm
+/// A subdirectory of images/ with symlinks
 const TAGS: &str = "tags";
-/// /descriptor/<url encoded MIME type>/<sha256>
-const DESCRIPTOR: &str = "descriptor";
-/// A subdirectory of images/
+
+/// The directory with content for a generic OCI image/artifact.
 const LAYERS: &str = "layers";
-/// Generic OCI artifacts (may be container images, or may not be)
-/// /artifacts
-///   /tags/<urlencoded name>
-///   /descriptor/<url encoded MIME type>/<sha256>
-const ARTIFACTS: &str = "artifacts";
+
+/// The directory with metadata for diffs associated with an unpacked
+/// image.
+const DIFFS: &str = "diffs";
+/// The filename containing metadata for a tar stream sufficient
+/// to reconstruct it bit-for-bit.
+const TAR_SPLIT_EXT: &str = "tar-split";
+/// The name of a composefs file for an unpacked root.
+const ROOTFS_CFS: &str = "rootfs.cfs";
+
 const TMP: &str = "tmp";
 
 /// Filename for manifest inside composefs
 const MANIFEST_NAME: &str = "manifest.json";
 /// Filename for config inside composefs
 const CONFIG_NAME: &str = "config.json";
-/// Filename for layers inside composefs; note this is not present for "unpacked" images.
-const LAYERS_NAME: &str = "layers";
+/// Filename for a locally generated composefs-augmented manifest.
+const MANIFEST_CFS_LOCAL: &str = "manifest-cfs-local.json";
 
-/// The extended attribute we store only inside the composefs
-/// which has the sha256 for the manifest.json.
-const MANIFEST_SHA256_XATTR: &str = "user.composefs.sha256";
+/// Annotation for a descriptor's fsverity
+const ANNOTATION_DESCRIPTOR_VERITY: &str = "containers.composefs.fsverity";
+const ANNOTATION_LAYER_VERITY: &str = "containers.composefs.layer.digest";
+const ANNOTATION_ROOTFS_VERITY: &str = "containers.composefs.rootfs.digest";
+
+const XATTR_PREFIX_TRUSTED: &str = "trusted.";
+const XATTR_PREFIX_USER: &str = "user.";
+
+/// fsverity digest of manifest-local-cfs.json
+const XATTR_MANIFEST_TO_LOCAL: &str = "composefs.manifest-local-cfs.fsverity";
+/// fsverity of original manifest.json
+const XATTR_LOCAL_TO_MANIFEST: &str = "composefs.manifest.fsverity";
+
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &str = "../../";
 
@@ -137,11 +149,11 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
 
 /// Given a tag name (arbitrary string), encode it in a way that is safe for a filename
 /// and prepend the tag directory to it.
-fn artifact_tag_path(name: &str) -> Utf8PathBuf {
+fn tag_path(name: &str) -> Utf8PathBuf {
     assert!(name.len() <= TAG_MAX);
     let tag_filename =
         percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
-    format!("{ARTIFACTS}/{TAGS}/{tag_filename}").into()
+    format!("{IMAGES}/{TAGS}/{tag_filename}").into()
 }
 
 /// The extended attribute we attach with the target metadata
