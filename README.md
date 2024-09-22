@@ -19,28 +19,46 @@ ostree and containers/storage in supporting multiple
 versioned filesystem trees with associated metadata,
 including support for e.g. garbage collection.
 
-## composefs-mapped OCI image
+## A cfs-oci image
 
-A "cfs-oci image" is a mapping of a standard OCI image
-into composefs. An OCI image is composed of 3 parts:
+By default, a cfs-oci image is a bit like a generic
+[OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
+in that it does not automatically unpack layers,
+but stores content directly.
 
-- manifest
-- config
-- rootfs (layers)
+### cfs-oci native annotations
 
-The mapping is simple; the manifest and config are JSON and are serialized
-into the toplevel, and the full *squashed* rootfs is stored in /rootfs.
+This project defines a annotation
+`containers.composefs.fsverity` that is the composefs
+fsverity-sha256 (as opposed to the default "content-sha256")
+that can be applied to a descriptor.
 
-```
-/manifest.json
-/config.json
-/rootfs
-```
+Additionally, a `containers.composefs.layer.fsverity` annotation
+can be added to `application/vnd.oci.image.layer.v1.tar` or one
+of its "sub-types" such as `application/vnd.oci.image.layer.v1.tar+gzip`.
+This digest holds the "canonical composefs tar fsverity" digest of
+the tarball mapped to an EROFS image.
 
-This is designed to allow directly (natively) mounting the composefs and using
-the `/rootfs` subdirectory as the target root filesystem.
+When these annotations are pre-computed by a build server,
+the signature covering the manifest hence covers both the
+default "content-sha256:" digest as well as the optimized
+`fsverity-sha256` digest.
 
-## composefs-mapped OCI artifact
+An image 
+
+### Non-native images
+
+An image that does not already have these annotations can
+be imported; they will be computed client side and stored
+as extended attributes instead. Each file stored in the
+`blobs/sha256` directory will have a
+`trusted.composefs.fsverity` xattr (when run as root,
+otherwise `user.composefs.fsverity`). In order to
+be robust against accidental corruption,
+the value is actually a [HMAC](https://en.wikipedia.org/wiki/HMAC)
+using the manifest's digest as a key.
+
+Additionally, the manifest will have a `trusted.composefs.`
 
 OCI artifacts are more general, and are effectively
 
