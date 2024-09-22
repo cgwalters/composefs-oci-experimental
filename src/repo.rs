@@ -41,6 +41,8 @@ const TAG_MAX: usize = 255;
 const REPOMETA: &str = "meta.json";
 /// A composefs/ostree style object directory
 const OBJECTS: &str = "objects";
+/// A directory with symlinks to ../objects
+const OBJECTS_BY_SHA256: &str = "objects-by-sha256";
 /// OCI images, may be either packed (or an artifact) or "unpacked"
 const IMAGES: &str = "images";
 /// A subdirectory of images/ with symlinks
@@ -93,6 +95,15 @@ type ObjectPath = Utf8PathBuf;
 /// Require that a descriptor's digest is sha256. Return the digest value.
 fn sha256_of_descriptor(desc: &Descriptor) -> Result<&str> {
     sha256_of_digest(desc.digest())
+}
+
+/// If a descriptor has a standard composefs fsverity annotation, parse and return it.
+fn fsverity_of_descriptor(desc: &Descriptor) -> Result<Option<Sha256Digest>> {
+    let Some(v) = desc.annotations().and_then(|a| a.get(ANNOTATION_DESCRIPTOR_VERITY)) else {
+        return Ok(None);
+    };
+    let v = Sha256Digest::from_str(v)?;
+    Ok(Some(v))
 }
 
 /// Require that a descriptor digest is sha256. Return the digest value.
@@ -566,17 +577,27 @@ impl RepoTransaction {
         Ok(buf)
     }
 
-    /// Import an object which also has a known descriptor.
+    /// Import an object which also has a known descriptor, and if
+    /// it does not have a native composefs digest as an annotation,
+    /// then include a symlink mapping the content-sha256 digest
+    /// to the fsverity object.
     /// The descriptor will be validated (size and content-sha256).
-    /// Also adds a link that allows lookup by sha256 digest.
     fn import_descriptor(
         &self,
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
     ) -> Result<ObjectDigest> {
-        let expected_sha256 = sha256_of_descriptor(descriptor)?;
+        let expected_fsverity = fsverity_of_descriptor(descriptor)?;
         let tmpf = tmpf.finish_validate(&descriptor)?;
         let objid = self.import_object(tmpf)?;
+        if let Some(expected_fsverity) = expected_fsverity {
+            if objid != expected_fsverity.digest() {
+                anyhow::bail!("Expected fsverity digest {} but found {objid} for descriptor {}", expected_fsverity.digest(), descriptor.digest());
+            }
+            // No need to make the by-sha256 link
+            return Ok(objid);
+        }
+        let expected_sha256 = sha256_of_descriptor(descriptor)?;
         let descriptor_path =
             object_digest_to_path_prefixed(expected_sha256.to_string(), OBJECTS_BY_SHA256);
         let target_path = object_digest_to_path_prefixed(objid.clone(), BY_SHA256_UPLINK);
@@ -592,18 +613,18 @@ impl RepoTransaction {
     }
 
     /// Import bytes which also has a known descriptor. The descriptor will be validated (size and content-sha256).
+    /// A mapping by-sha256 symlink is not added.
     fn import_descriptor_from_bytes(
         &self,
         descriptor: &Descriptor,
         buf: &[u8],
     ) -> Result<ObjectDigest> {
         let tmpf = self.new_descriptor_with_bytes(buf)?;
-        let tmpf = tmpf.finish_validate(&descriptor)?;
-        self.import_object(tmpf)
+        self.import_descriptor(tmpf, descriptor)
     }
 
-    fn add_artifact_tag(&self, objid: ObjectDigest, name: &str) -> Result<()> {
-        let path = artifact_tag_path(name);
+    fn add_tag(&self, objid: ObjectDigest, name: &str) -> Result<()> {
+        let path = tag_path(name);
         let target_path = object_digest_to_path_prefixed(objid.clone(), "../../objects");
         ignore_eexist(
             rustix::fs::symlinkat(
@@ -662,7 +683,7 @@ impl RepoTransaction {
                 .context(OBJECTS_BY_SHA256)?;
             Self::commit_objects(&from_by_sha256, &to_by_sha256).await?;
         }
-        for name in [ARTIFACTS, IMAGES] {
+        for name in [IMAGES] {
             let tags_name = format!("{name}/{TAGS}");
             let from_tags = from_basedir
                 .open_dir(&tags_name)
@@ -792,17 +813,11 @@ impl Repo {
                 serde_json::to_writer(w, &meta).map_err(anyhow::Error::msg)
             })?;
         }
-        // Images and artifacts
-        for name in [ARTIFACTS, IMAGES] {
+        for name in [IMAGES] {
             dir.ensure_dir_with(name, dirbuilder).context(name)?;
             dir.ensure_dir_with(format!("{name}/{TAGS}"), dirbuilder)
                 .context(TAGS)?;
-            dir.ensure_dir_with(format!("{name}/{DESCRIPTOR}"), dirbuilder)
-                .context(DESCRIPTOR)?;
         }
-        // A special subdir for images/
-        dir.ensure_dir_with(format!("{IMAGES}/{LAYERS}"), dirbuilder)
-            .context("Creating layers dir")?;
         // The overall object dir, and its child by-sha256
         for name in [OBJECTS, OBJECTS_BY_SHA256] {
             dir.ensure_dir_with(name, dirbuilder).context(name)?;
@@ -832,11 +847,13 @@ impl Repo {
         Ok(Self(inner))
     }
 
+    /// Open a repository
     #[context("Opening composefs-oci repo")]
     pub fn open(dir: Dir) -> Result<Self> {
         Self::impl_open(dir, Default::default())
     }
 
+    /// Create a new transaction
     pub fn new_transaction(&self) -> Result<RepoTransaction> {
         RepoTransaction::new(&self)
     }
@@ -854,6 +871,8 @@ impl Repo {
         Ok(())
     }
 
+    /// Return true if fsverity was enabled and supported by the kernel
+    /// and filesystem when this repository was created.
     pub fn has_verity(&self) -> bool {
         self.0.meta.verity
     }
@@ -891,7 +910,7 @@ impl Repo {
         let repo = Arc::clone(&self.0);
         let tag = tag.to_owned();
         tokio::task::spawn_blocking(move || -> Result<_> {
-            let tagpath = artifact_tag_path(&tag);
+            let tagpath = tag_path(&tag);
             let Some(buf) = map_rustix_optional(rustix::fs::readlinkat(
                 &repo.dir,
                 tagpath.as_std_path(),
@@ -1043,16 +1062,17 @@ impl Repo {
         .unwrap()
     }
 
-    /// Pull the target artifact; does not update the tag if it already exists
-    pub async fn pull_artifact(
+    /// Pull the target image, and add the provided tag. If this is a mountable
+    /// image (i.e. not an artifact), it is *not* unpacked by default.
+    pub async fn pull(
         &self,
         txn: RepoTransaction,
         proxy: &containers_image_proxy::ImageProxy,
         imgref: &str,
     ) -> Result<(RepoTransaction, Descriptor)> {
-        if let Some(meta) = self.read_artifact_metadata(imgref).await? {
-            return Ok((txn, meta.manifest_descriptor));
-        }
+        // if let Some(meta) = self.read_artifact_metadata(imgref).await? {
+        //     return Ok((txn, meta.manifest_descriptor));
+        // }
 
         let img = proxy.open_image(&imgref).await.context("Opening image")?;
         let (manifest_digest, raw_manifest) = proxy
@@ -1066,9 +1086,11 @@ impl Repo {
             raw_manifest.len().try_into().unwrap(),
             manifest_digest,
         );
-        let manifest_fsverity = txn
-            .import_descriptor_from_bytes(&manifest_descriptor, &raw_manifest)
-            .context("Importing manifest")?;
+        let manifest_fsverity = {
+            let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
+            txn
+            .import_descriptor(tmpf, &manifest_descriptor).context("Importing manifest")?
+        };
 
         let manifest = ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
         let txn = Arc::new(txn);
