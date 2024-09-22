@@ -114,8 +114,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
             table.set_header(vec!["NAME", "TYPE", "CREATED", "SIZE"]);
             for tag in repo.list_tags(None).await? {
                 let metadata = repo
-                    .read_artifact_metadata(&tag)
-                    .await?
+                    .image_metadata_from_tag(&tag)?
                     .ok_or_else(|| anyhow!("Expected metadata for {tag}"))?;
                 let ty = metadata
                     .manifest
@@ -155,7 +154,7 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
         }
         Opt::Inspect { repo_opts, name } => {
             let repo = repo_opts.open()?;
-            if let Some(meta) = repo.read_artifact_metadata(&name).await? {
+            if let Some(meta) = repo.image_metadata_from_tag(&name)? {
                 let mut stdout = std::io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &meta)?;
             } else {

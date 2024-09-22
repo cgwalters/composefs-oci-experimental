@@ -78,7 +78,7 @@ pub(crate) fn openat_rooted(
 
 /// Not all operations can be performed on an O_PATH directory; e.g.
 /// fsetxattr() can't.
-pub fn fsetxattr<Fd: AsFd>(
+pub(crate) fn fsetxattr<Fd: AsFd>(
     fd: Fd,
     name: &str,
     value: &[u8],
@@ -86,6 +86,40 @@ pub fn fsetxattr<Fd: AsFd>(
 ) -> rustix::io::Result<()> {
     let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
     rustix::fs::setxattr(&path, name, value, flags)
+}
+
+/// Get an extended attribute value.
+pub(crate) fn fgetxattr<Fd: AsFd>(
+    fd: Fd,
+    name: &str,
+    flags: rustix::fs::XattrFlags,
+) -> Result<Vec<u8>> {
+    let fd = fd.as_fd();
+    let mut buf = Vec::new();
+    // TODO: Handle looping; not a problem now since for the xattrs we care about
+    // we never mutate them.
+    let mut n = rustix::fs::fgetxattr(fd, name, &mut buf)?;
+    buf.resize(n, 0u8);
+    let n = rustix::fs::fgetxattr(fd, name, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Get an extended attribute value.
+pub(crate) fn fgetxattr_pathfd<Fd: AsFd>(
+    fd: Fd,
+    name: &str,
+    flags: rustix::fs::XattrFlags,
+) -> Result<Vec<u8>> {
+    let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+    let mut buf = Vec::new();
+    // TODO: Handle looping; not a problem now since for the xattrs we care about
+    // we never mutate them.
+    let mut n = rustix::fs::getxattr(&path, name, &mut buf)?;
+    buf.resize(n, 0u8);
+    let n = rustix::fs::getxattr(&path, name, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// Manual implementation of recursive dir walking using openat2

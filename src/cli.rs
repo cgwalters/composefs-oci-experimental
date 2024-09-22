@@ -7,7 +7,7 @@ pub(crate) async fn pull(opts: crate::PullOpts) -> Result<()> {
     let proxy = containers_image_proxy::ImageProxy::new().await?;
 
     let txn = repo.new_transaction()?;
-    let (txn, descriptor) = repo.pull_artifact(txn, &proxy, &opts.image).await?;
+    let (txn, descriptor) = repo.pull(txn, &proxy, &opts.image).await?;
     repo.commit(txn).await?;
     println!("Imported: {}", descriptor.digest());
 
