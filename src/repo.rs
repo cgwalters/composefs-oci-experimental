@@ -82,7 +82,7 @@ const XATTR_MANIFEST_ORIG: &str = "composefs.manifest-original.digest";
 const XATTR_DESCRIPTOR_DIGEST: &str = "composefs.descriptor.digest";
 
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
-const BY_SHA256_UPLINK: &str = "../../";
+const BY_SHA256_UPLINK: &str = "../../objects/";
 
 /// Can be included in a manifest if the digest is pre-computed
 const CFS_DIGEST_ANNOTATION: &str = "composefs.digest";
@@ -352,6 +352,13 @@ fn test_fsverity_in(d: &Dir) -> Result<bool> {
     Ok(composefs::fsverity::fsverity_enable(tf.as_file().as_fd()).is_ok())
 }
 
+fn fsverity_hexdigest_from_fd(fd: impl AsFd) -> Result<String> {
+    let mut digest = VerityDigest::new();
+    composefs::fsverity::fsverity_digest_from_fd(fd.as_fd(), &mut digest)
+        .context("Computing fsverity digest")?;
+    Ok(hex::encode(digest.get()))
+}
+
 // Rename all regular files from -> to. Non-regular and non-symlink files will be ignored.
 // If a target file with the given name already exists in "to", the file is left
 // in the "from" directory.
@@ -529,13 +536,6 @@ impl RepoTransaction {
         Ok(())
     }
 
-    fn fsverity_hexdigest_from_fd(fd: BorrowedFd) -> Result<String> {
-        let mut digest = VerityDigest::new();
-        composefs::fsverity::fsverity_digest_from_fd(fd, &mut digest)
-            .context("Computing fsverity digest")?;
-        Ok(hex::encode(digest.get()))
-    }
-
     #[context("Importing object")]
     fn import_object(&self, mut tmpfile: TempFile) -> Result<ObjectDigest> {
         // Rewind to ensure we read from the start
@@ -551,7 +551,7 @@ impl RepoTransaction {
             composefs::fsverity::fsverity_enable(tmpfile.as_file().as_fd())
                 .context("Failed to enable fsverity")?;
         };
-        let digest = Self::fsverity_hexdigest_from_fd(tmpfile.as_file().as_fd())
+        let digest = fsverity_hexdigest_from_fd(tmpfile.as_file().as_fd())
             .context("Computing fsverity digest")?;
         let mut buf = digest.clone();
         buf.insert(2, '/');
@@ -901,13 +901,15 @@ impl Repo {
         Ok(())
     }
 
-    fn read_object_by_digest_all(&self, digest: &Sha256Digest) -> Result<Vec<u8>> {
-        let path = object_digest_to_path_prefixed(digest.digest().into(), OBJECTS_BY_SHA256);
-        let mut f = self.0.dir.open(&path)?;
+    fn read_verity_object(&self, digest: &Sha256Digest) -> Result<Vec<u8>> {
+        let path = object_digest_to_path(digest.digest().into());
+        let f = self.0.objects.open(&path)?;
         let size = f.metadata()?.size();
         if size > (METADATA_MAX as u64) {
             anyhow::bail!("Descriptor size={size} exceeded max={METADATA_MAX}");
         }
+        let found_digest = fsverity_hexdigest_from_fd(&f)?;
+        compare_digests(digest.digest(), &found_digest)?;
         let mut buf = Vec::with_capacity(size as usize);
         Self::read_all_validate_sha256(f, digest, &mut buf)?;
         Ok(buf)
@@ -936,9 +938,9 @@ impl Repo {
 
     pub(crate) fn prefix_xattr(&self, key: &str) -> String {
         if self.0.privileged {
-            format!("{XATTR_PREFIX_TRUSTED}.{key}")
+            format!("{XATTR_PREFIX_TRUSTED}{key}")
         } else {
-            format!("{XATTR_PREFIX_USER}.{key}")
+            format!("{XATTR_PREFIX_USER}{key}")
         }
     }
 
@@ -963,7 +965,7 @@ impl Repo {
         let (manifest, manifest_digest) = if !is_native {
             let xattr_key = self.prefix_xattr(XATTR_MANIFEST_ORIG);
             let orig_digest = Self::parse_digest_xattr(&f, &xattr_key)?;
-            let manifest = self.read_object_by_digest_all(&orig_digest)?;
+            let manifest = self.read_verity_object(&orig_digest)?;
             let manifest = serde_json::from_slice(&manifest)?;
             (manifest, orig_digest)
         } else {
@@ -1174,7 +1176,7 @@ impl Repo {
     fn fsck_one_object(&self, objid: &str) -> Result<Option<CorruptionEvent>> {
         let path = object_digest_to_path(objid.to_string());
         let f = self.0.objects.open(&path)?;
-        let found_digest = RepoTransaction::fsverity_hexdigest_from_fd(f.as_fd())?;
+        let found_digest = fsverity_hexdigest_from_fd(f)?;
         let r = if found_digest != objid {
             Some(CorruptionEvent::FsVerity(objid.into()))
         } else {
