@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::{Add, ControlFlow};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
@@ -437,6 +437,15 @@ impl RepoTransaction {
         Ok(desc)
     }
 
+    fn import_object_from_fn<F>(&self, f: F) -> Result<ObjectDigest>
+    where
+        F: FnOnce(&mut cap_std::fs::File) -> Result<()>,
+    {
+        let mut tmpf = self.new_object()?;
+        f(tmpf.as_file_mut())?;
+        self.import_object(tmpf)
+    }
+
     fn import_tar(&self, src: File) -> Result<()> {
         let src = std::io::BufReader::new(src);
         let mut archive = tar::Archive::new(src);
@@ -604,9 +613,10 @@ impl RepoTransaction {
         // can be efficiently looked up.
         {
             let full_digest = descriptor.digest().to_string();
+            let xattr_key = self.repo.prefix_xattr(XATTR_DESCRIPTOR_DIGEST);
             rustix::fs::fsetxattr(
                 tmpf.as_file().as_fd(),
-                XATTR_DESCRIPTOR_DIGEST,
+                xattr_key,
                 full_digest.as_bytes(),
                 rustix::fs::XattrFlags::empty(),
             )?;
@@ -640,20 +650,6 @@ impl RepoTransaction {
     ) -> Result<ObjectDigest> {
         let tmpf = self.new_descriptor_with_bytes(buf)?;
         self.import_descriptor(tmpf, descriptor)
-    }
-
-    fn add_tag(&self, manifest_digest: &ObjectDigest, name: &str) -> Result<()> {
-        let path = tag_path(name);
-        let target_path = object_digest_to_path_prefixed(manifest_digest.clone(), "../");
-        ignore_eexist(
-            rustix::fs::symlinkat(
-                target_path.as_std_path(),
-                &self.repo.0.dir,
-                path.as_std_path(),
-            )
-            .map_err(|e| e.into()),
-        )?;
-        Ok(())
     }
 
     #[context("Unpacking regfile")]
@@ -715,16 +711,15 @@ impl RepoTransaction {
             Self::commit_objects(&from_by_sha256, &to_by_sha256).await?;
         }
         for name in [IMAGES, UNPACKED] {
-            let tags_name = format!("{name}/");
             let from_tags = from_basedir
-                .open_dir(&tags_name)
-                .with_context(|| format!("Opening {tags_name}"))?;
+                .open_dir(&name)
+                .with_context(|| format!("Opening {name}"))?;
             let to_tags = to_basedir
-                .open_dir(&tags_name)
-                .with_context(|| format!("Opening {tags_name}"))?;
+                .open_dir(&name)
+                .with_context(|| format!("Opening {name}"))?;
             merge_dir_to(from_tags, to_tags)
                 .await
-                .context("Committing tags")?;
+                .with_context(|| format!("Committing {name}"))?;
         }
         // SAFETY: This just propagates panics, which is OK
         Ok(self.stats.into_inner().unwrap())
@@ -734,19 +729,6 @@ impl RepoTransaction {
     pub fn discard(self) -> Result<()> {
         self.workdir.close()?;
         Ok(())
-    }
-}
-
-fn dir_cfs_entry(path: &Utf8Path) -> Entry<'static> {
-    let item = Item::Directory { size: 0, nlink: 1 };
-    Entry {
-        path: Cow::Owned(path.into()),
-        uid: 0,
-        gid: 0,
-        mode: libc::S_IFDIR | 0700,
-        mtime: Mtime { sec: 0, nsec: 0 },
-        item,
-        xattrs: Default::default(),
     }
 }
 
@@ -776,6 +758,8 @@ pub enum CorruptionEvent {
 struct RepoInner {
     dir: Dir,
     bootid: &'static str,
+    /// Whether or not we had CAP_SYS_ADMIN
+    privileged: bool,
     objects: Dir,
     reuse_object_dirs: Arc<Mutex<Vec<Dir>>>,
     meta: RepoMetadata,
@@ -832,10 +816,14 @@ impl Repo {
                 .with_context(|| format!("Opening {REPOMETA}"))?,
         )?;
         let objects = dir.open_dir(OBJECTS).context(OBJECTS)?;
+        let process_uid = rustix::process::getuid();
+        let privileged =
+            rustix::thread::capability_is_in_ambient_set(rustix::thread::Capability::SystemAdmin)?;
         let inner = Arc::new(RepoInner {
             dir,
             objects,
             bootid,
+            privileged,
             meta,
             reuse_object_dirs,
         });
@@ -946,6 +934,14 @@ impl Repo {
         Ok(r)
     }
 
+    pub(crate) fn prefix_xattr(&self, key: &str) -> String {
+        if self.0.privileged {
+            format!("{XATTR_PREFIX_TRUSTED}.{key}")
+        } else {
+            format!("{XATTR_PREFIX_USER}.{key}")
+        }
+    }
+
     fn parse_digest_xattr(f: &File, xattr: &str) -> Result<Sha256Digest> {
         let digest = fileutils::fgetxattr(&f, xattr, rustix::fs::XattrFlags::empty())?;
         let digest = String::from_utf8(digest)?;
@@ -956,32 +952,34 @@ impl Repo {
         let Some(f) = self.0.dir.open_optional(&path)? else {
             return Ok(None);
         };
-        let f = f.into_std();
+        let mut f = f.into_std();
         let manifest_meta = f.metadata()?;
-        let cfs_manifest: ImageManifest = serde_json::from_reader(BufReader::new(f))?;
+        let cfs_manifest: ImageManifest = serde_json::from_reader(BufReader::new(&mut f))?;
 
         let config_descriptor = cfs_manifest.config();
         // TODO read descriptor via fsverity instead
         let is_native = fsverity_of_descriptor(config_descriptor)?.is_some();
 
         let (manifest, manifest_digest) = if !is_native {
-            let orig_digest = Self::parse_digest_xattr(&f, XATTR_MANIFEST_ORIG)?;
+            let xattr_key = self.prefix_xattr(XATTR_MANIFEST_ORIG);
+            let orig_digest = Self::parse_digest_xattr(&f, &xattr_key)?;
             let manifest = self.read_object_by_digest_all(&orig_digest)?;
             let manifest = serde_json::from_slice(&manifest)?;
             (manifest, orig_digest)
         } else {
-            let digest = Self::parse_digest_xattr(&f, XATTR_DESCRIPTOR_DIGEST)?;
+            let xattr_key = self.prefix_xattr(XATTR_DESCRIPTOR_DIGEST);
+            let digest = Self::parse_digest_xattr(&f, &xattr_key)?;
             (cfs_manifest, digest)
         };
 
-        let config = self.read_descriptor_all(cfs_manifest.config())?;
+        let config = self.read_descriptor_all(manifest.config())?;
         let config = serde_json::from_slice(&config)?;
 
         let size = manifest_meta.size();
         let manifest_descriptor = Descriptor::new(MediaType::ImageManifest, size, manifest_digest);
 
         let r = Metadata {
-            manifest: cfs_manifest,
+            manifest: manifest,
             config,
             manifest_descriptor,
         };
@@ -1125,13 +1123,25 @@ impl Repo {
         for (i, layer) in manifest.layers().iter().enumerate() {
             let digest = sha256_of_descriptor(layer)?;
             let objid = existing_layers.get(digest).unwrap();
-            let mut augmented_layer = augmented_manifest.layers_mut().get_mut(i).unwrap();
+            let augmented_layer = augmented_manifest.layers_mut().get_mut(i).unwrap();
             let mut annos = augmented_layer.annotations().clone().unwrap_or_default();
             annos.insert(ANNOTATION_LAYER_VERITY.to_string(), objid.clone());
             augmented_layer.set_annotations(Some(annos));
         }
 
-        txn.add_tag(&manifest_digest_sha256, &imgref)?;
+        let augmented_manifest_objid = txn.import_object_from_fn(move |f| -> Result<()> {
+            let xattr_key = self.prefix_xattr(XATTR_MANIFEST_ORIG);
+            rustix::fs::fsetxattr(
+                f.as_fd(),
+                &xattr_key,
+                manifest_fsverity.as_bytes(),
+                rustix::fs::XattrFlags::empty(),
+            )?;
+            serde_json::to_writer(f, &manifest)?;
+            Ok(())
+        })?;
+        let path = tag_path(&imgref);
+        txn.link_object_at(&augmented_manifest_objid, &self.0.dir, &path)?;
 
         // SAFETY: We joined all the threads
         let txn = Arc::into_inner(txn).unwrap();

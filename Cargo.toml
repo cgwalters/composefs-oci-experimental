@@ -15,7 +15,7 @@ clap = { version= "4.2", features = ["derive"] }
 fn-error-context = "0.2.0"
 ocidir = { version = "0.3" }
 openssl = "0.10.33"
-rustix = { version = "0.38.34", features = ["fs"] }
+rustix = { version = "0.38.34", features = ["fs", "process", "thread"] }
 libc = "0.2"
 percent-encoding = "2"
 serde = "1"
