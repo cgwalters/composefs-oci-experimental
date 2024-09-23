@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufReader, Seek, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::ops::{Add, ControlFlow};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
@@ -36,6 +36,8 @@ use crate::fileutils::{self, ignore_eexist, linkat_optional_allow_exists, map_ru
 
 /// Maximum length of a tag name
 const TAG_MAX: usize = 255;
+/// Maximum size of a manifest or config
+const METADATA_MAX: usize = 5 * 1024 * 1024;
 
 /// Standardized metadata
 const REPOMETA: &str = "meta.json";
@@ -893,6 +895,33 @@ impl Repo {
             })
     }
 
+    /// Read the complete content of a descriptor 
+    #[context("Reading descriptor {}", descriptor.digest())]
+    fn read_descriptor_all(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
+        // TODO also handle fsverity case
+        let digest = sha256_of_descriptor(descriptor)?;
+        let path = object_digest_to_path_prefixed(digest.to_string(), OBJECTS_BY_SHA256);
+        let f = self.0.dir.open(&path)?;
+        let meta = f.metadata()?;
+        let expected_size = descriptor.size();
+        let found_size = meta.size();
+        if  expected_size != meta.size() {
+            anyhow::bail!("Expected size={expected_size} but found {found_size}");
+        }
+        if descriptor.size() > (METADATA_MAX as u64) {
+            anyhow::bail!("Descriptor size={found_size} exceeded max={METADATA_MAX}");
+        }
+        let mut r = Vec::with_capacity(found_size as usize);
+        f.read_to_end(&mut r)?;
+        let h = Hasher::new(MessageDigest::sha256())?;
+        h.update(&r);
+        let found_sha256 = hex::encode(self.sha256hasher.finish()?);
+        if found_sha256 != digest {
+            anyhow::bail!("Expected digest={digest} but found {found_sha256}");
+        }
+        Ok(r)
+    }
+
     fn image_metadata_from_path(&self, path: &Utf8Path) -> Result<Option<Metadata>> {
         let Some(dir) = self.0.dir.open_dir_optional(&path)? else {
             return Ok(None);
@@ -900,8 +929,6 @@ impl Repo {
         let manifest = dir.open(MANIFEST_NAME)?;
         let manifest_meta = manifest.metadata()?;
         let manifest = serde_json::from_reader(BufReader::new(manifest))?;
-        let config = dir.open(CONFIG_NAME).map(BufReader::new)?;
-        let config = serde_json::from_reader(config)?;
 
         let mut buf = [0u8; 1024];
         let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;

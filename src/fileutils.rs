@@ -78,7 +78,7 @@ pub(crate) fn openat_rooted(
 
 /// Not all operations can be performed on an O_PATH directory; e.g.
 /// fsetxattr() can't.
-pub fn fsetxattr<Fd: AsFd>(
+pub(crate) fn fsetxattr<Fd: AsFd>(
     fd: Fd,
     name: &str,
     value: &[u8],
@@ -87,6 +87,16 @@ pub fn fsetxattr<Fd: AsFd>(
     let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
     rustix::fs::setxattr(&path, name, value, flags)
 }
+
+pub(crate) fn fgetxattr<Fd: AsFd>(
+    fd: Fd,
+    name: &str,
+    flags: rustix::fs::XattrFlags) -> Result<Vec<u8>> {
+        
+        let mut buf = [0u8; 1024];
+        let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;
+        let buf = &buf[0..n];   
+    }
 
 /// Manual implementation of recursive dir walking using openat2
 pub(crate) fn ensure_dir_recursive(fd: BorrowedFd, p: &Path, init: bool) -> io::Result<bool> {
