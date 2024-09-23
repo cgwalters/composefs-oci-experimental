@@ -31,22 +31,9 @@ including support for e.g. garbage collection.
 ## A cfs-oci image
 
 By default, a cfs-oci image is a bit like a generic
-[OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)
-in that it does not automatically unpack layers,
-but stores content directly.
-
-An image is represented as a directory.
-
-There are 2-3 default files in an image directory.
-
-- `manifest.json`: The manifest file; a hard link to the object store
-- `config.json`: The image configuration; hard link to the object store
-- `manifest-cfs-local.json`: Only present for an image without precomputed composefs annotations (see below).
-
-### Generic artifact components
-
-For a generic OCI artifact, there is one additional sub-directory:
-
+[OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md),
+although there is no `index.json`, but instead a directory with URL-encoded
+descriptor names that are hard links to `manifest.json`.
 - `layers/<digest>`: A directory with an entry for each layer (blob) named by its descriptor digest.
 
 ### image.cfs for an unpacked OCI image
@@ -119,9 +106,9 @@ It has the following layout:
    The digest here is the fsverity digest.
 - `objects-by-sha256`: A split-digest object directory with symbolic links to `../../objects`, only used
    for images that don't have the annotation `containers.composefs.layer.digest`.
-- `images/`: A split-digest directory for OCI images, named by their manifest sha256 digest.
-- `images/tags`: A directory with symbolic links to `../` (images), with the file name being a URL encoding of
-   the tag.
+- `images/`: Directory of URL encoded hardlinks to `manifest.json`.
+- `diffs/`: A split-digest directory with tar-split diffs sufficient to reconstruct an original
+   tar stream.
 
 #### "split-digest" format
 

@@ -88,15 +88,22 @@ pub(crate) fn fsetxattr<Fd: AsFd>(
     rustix::fs::setxattr(&path, name, value, flags)
 }
 
+/// Get an extended attribute value.
 pub(crate) fn fgetxattr<Fd: AsFd>(
     fd: Fd,
     name: &str,
-    flags: rustix::fs::XattrFlags) -> Result<Vec<u8>> {
-        
-        let mut buf = [0u8; 1024];
-        let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;
-        let buf = &buf[0..n];   
-    }
+    flags: rustix::fs::XattrFlags,
+) -> Result<Vec<u8>> {
+    let path = format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd());
+    let mut buf = Vec::new();
+    // TODO: Handle looping; not a problem now since for the xattrs we care about
+    // we never mutate them.
+    let mut n = rustix::fs::getxattr(&path, name, &mut buf)?;
+    buf.resize(n, 0u8);
+    let n = rustix::fs::getxattr(&path, name, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
 
 /// Manual implementation of recursive dir walking using openat2
 pub(crate) fn ensure_dir_recursive(fd: BorrowedFd, p: &Path, init: bool) -> io::Result<bool> {

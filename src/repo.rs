@@ -23,8 +23,7 @@ use composefs::fsverity::Digest as VerityDigest;
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
 use ocidir::oci_spec::image::{
-    Descriptor, Digest as DescriptorDigest, DigestAlgorithm, ImageConfiguration, ImageManifest,
-    MediaType, Sha256Digest,
+    Descriptor, Digest as DescriptorDigest, DigestAlgorithm, ImageConfiguration, ImageManifest, ImageManifestBuilder, MediaType, Sha256Digest
 };
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
@@ -66,8 +65,6 @@ const TMP: &str = "tmp";
 
 /// Filename for manifest inside composefs
 const MANIFEST_NAME: &str = "manifest.json";
-/// Filename for config inside composefs
-const CONFIG_NAME: &str = "config.json";
 /// Filename for a locally generated composefs-augmented manifest.
 const MANIFEST_CFS_LOCAL: &str = "manifest-cfs-local.json";
 
@@ -901,7 +898,7 @@ impl Repo {
         // TODO also handle fsverity case
         let digest = sha256_of_descriptor(descriptor)?;
         let path = object_digest_to_path_prefixed(digest.to_string(), OBJECTS_BY_SHA256);
-        let f = self.0.dir.open(&path)?;
+        let mut f = self.0.dir.open(&path)?;
         let meta = f.metadata()?;
         let expected_size = descriptor.size();
         let found_size = meta.size();
@@ -913,9 +910,9 @@ impl Repo {
         }
         let mut r = Vec::with_capacity(found_size as usize);
         f.read_to_end(&mut r)?;
-        let h = Hasher::new(MessageDigest::sha256())?;
-        h.update(&r);
-        let found_sha256 = hex::encode(self.sha256hasher.finish()?);
+        let mut h = Hasher::new(MessageDigest::sha256())?;
+        h.update(&r)?;
+        let found_sha256 = hex::encode(h.finish()?);
         if found_sha256 != digest {
             anyhow::bail!("Expected digest={digest} but found {found_sha256}");
         }
@@ -928,7 +925,10 @@ impl Repo {
         };
         let manifest = dir.open(MANIFEST_NAME)?;
         let manifest_meta = manifest.metadata()?;
-        let manifest = serde_json::from_reader(BufReader::new(manifest))?;
+        let manifest: ImageManifest = serde_json::from_reader(BufReader::new(manifest))?;
+
+        let config = self.read_descriptor_all(manifest.config())?;
+        let config = serde_json::from_slice(&config)?;
 
         let mut buf = [0u8; 1024];
         let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;
@@ -1031,9 +1031,12 @@ impl Repo {
             txn.import_descriptor(tmpf, &manifest_descriptor)
                 .context("Importing manifest")?
         };
+
+
         txn.link_object_at(&manifest_fsverity, img_tmpdir.as_fd(), MANIFEST_NAME)?;
 
         let manifest = ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
+        let mut augmented_manifest = manifest.clone();
 
         let txn = Arc::new(txn);
         let config_descriptor = manifest.config();
@@ -1047,10 +1050,9 @@ impl Repo {
         let (config, driver) = tokio::join!(config, driver);
         let _: () = driver?;
         let config = config?;
-        let objid = txn
+        let config_fsverity = txn
             .import_descriptor_from_bytes(&config_descriptor, &config)
             .context("Importing config")?;
-        txn.link_object_at(&objid, &tmp, Path::new(CONFIG_NAME))?;
 
         let mut layers_by_digest = HashMap::new();
         let (mut existing_layers, to_fetch_layers) = manifest.layers().iter().try_fold(
@@ -1093,6 +1095,15 @@ impl Repo {
             existing_layers.insert(layer_sha256, objid);
         }
         tracing::debug!("Imported all layers");
+
+        for (i, layer) in manifest.layers().iter().enumerate() {
+            let digest = sha256_of_descriptor(layer)?;
+            let objid = existing_layers.get(digest).unwrap();
+            let mut augmented_layer = augmented_manifest.layers_mut().get_mut(i).unwrap();
+            let mut annos = augmented_layer.annotations().clone().unwrap_or_default();
+            annos.insert(ANNOTATION_LAYER_VERITY.to_string(), objid.clone());
+            augmented_layer.set_annotations(Some(annos));
+        }
 
         txn.add_tag(&manifest_digest_sha256, &imgref)?;
 
