@@ -28,7 +28,7 @@ use ocidir::oci_spec::image::{
 };
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
-use rustix::fs::AtFlags;
+use rustix::fs::{AtFlags, XattrFlags};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -81,6 +81,8 @@ const XATTR_PREFIX_USER: &str = "user.";
 const XATTR_MANIFEST_TO_LOCAL: &str = "composefs.manifest-local-cfs.fsverity";
 /// fsverity of original manifest.json
 const XATTR_LOCAL_TO_MANIFEST: &str = "composefs.manifest.fsverity";
+/// The extended attribute attached to a directory with the manifest sha256
+const XATTR_MANIFEST_SHA256: &str = "composefs.manifest.digest";
 
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &str = "../../";
@@ -746,7 +748,7 @@ pub struct Metadata {
     /// The fsverity object ID for the composefs itself
     // pub objectid: String,
     /// The descriptor for the manifest.
-    // pub manifest_descriptor: Descriptor,
+    pub manifest_descriptor: Descriptor,
     /// The parsed manifest
     pub manifest: ImageManifest,
     /// The parsed config
@@ -895,12 +897,25 @@ impl Repo {
         let Some(dir) = self.0.dir.open_dir_optional(&path)? else {
             return Ok(None);
         };
-        let manifest = dir.open(MANIFEST_NAME).map(BufReader::new)?;
-        let manifest = serde_json::from_reader(manifest)?;
+        let manifest = dir.open(MANIFEST_NAME)?;
+        let manifest_meta = manifest.metadata()?;
+        let manifest = serde_json::from_reader(BufReader::new(manifest))?;
         let config = dir.open(CONFIG_NAME).map(BufReader::new)?;
         let config = serde_json::from_reader(config)?;
 
-        let r = Metadata { manifest, config };
+        let mut buf = [0u8; 1024];
+        let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;
+        let buf = &buf[0..n];
+        let buf = str::from_utf8(buf)?;
+        let manifest_digest = Sha256Digest::from_str(buf)?;
+        let size = manifest_meta.size();
+        let manifest_descriptor = Descriptor::new(MediaType::ImageManifest, size, manifest_digest);
+
+        let r = Metadata {
+            manifest,
+            config,
+            manifest_descriptor,
+        };
         Ok(Some(r))
     }
 
@@ -978,6 +993,12 @@ impl Repo {
             raw_manifest.len().try_into().unwrap(),
             manifest_digest,
         );
+        rustix::fs::fsetxattr(
+            img_tmpdir.as_fd(),
+            XATTR_MANIFEST_SHA256,
+            manifest_digest_sha256.as_bytes(),
+            XattrFlags::empty(),
+        )?;
         let manifest_fsverity = {
             let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
             txn.import_descriptor(tmpf, &manifest_descriptor)
