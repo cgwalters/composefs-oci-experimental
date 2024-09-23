@@ -33,16 +33,24 @@ including support for e.g. garbage collection.
 By default, a cfs-oci image is a bit like a generic
 [OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md),
 although there is no `index.json`, but instead a directory with URL-encoded
-descriptor names that are hard links to `manifest.json`.
-- `layers/<digest>`: A directory with an entry for each layer (blob) named by its descriptor digest.
+names.
 
-### image.cfs for an unpacked OCI image
+A cfs-oci image can have two manifest forms: "native" and "imported".
+A native image has all relevant annotations included in `manifest.json`.
+The composefs manifest for an imported image can be found via an extended
+attribute attached to the manifest.
 
-- `diffs/<digest>.tar-split`: The "tar split" metadata for this image that provides
-   sufficient metadata to reconstruct the tar stream corresponding to the diffid.
-- `rootfs.cfs`: A mountable composefs with the complete merged root filesystem.
+Additionally, each non-artifact image (with tar layers) can be either "packed" or "unpacked", or both.
 
-### Combined artifact and unpacked
+### packed vs unpacked
+
+A very common use case for cfs-oci will be to fetch a non-artifact image and
+unpack the layers and create the final merged rootfs, ready to be mounted.
+The original compressed tar layers will not be stored.
+
+However, we also aim to support fully generic use cases (OCI artifacts)
+as well as storing *packed* images which allows mirroring offline, etc.
+In this case, 
 
 An image can be both an artifact *and* unpacked, i.e. both the compressed
 layer tarballs and the final merged rootfs are stored. This can be useful
@@ -84,17 +92,13 @@ Note that computing this digest can be computed relatively cheaply assuming that
 
 This digest must match that for `rootfs.cfs`.
 
-### Unannotated images
+### Imported images
 
 An image that does not already have these annotations 
-as part of the `manifest.json` can still be imported. 
-The modified manifest will be stored as `manifest-local-cfs.json` alongside
-the `manifest.json`. In order to be robust against accidental corruption,
-(strongly tying the modified manifest to its original), the two
-manifests are cross-linked via extended attributes. On the original
-manifest, an extended attribute `trusted.composefs.manifest-local-cfs.fsverity`
-will contain the fsverity digest of the `manifest-local-cfs.json`.
-An extended attribute `trusted.composefs.manifest.fsverity` is part of the `manifest-local-cfs.json`.
+as part of the `manifest.json` can still be imported.
+The original manifest is linked via an extended attribute
+`composefs.manifest-original.digest` that contains
+the digest for the original manifest.
 
 ### Layout
 
@@ -106,9 +110,8 @@ It has the following layout:
    The digest here is the fsverity digest.
 - `objects-by-sha256`: A split-digest object directory with symbolic links to `../../objects`, only used
    for images that don't have the annotation `containers.composefs.layer.digest`.
-- `images/`: Directory of URL encoded hardlinks to `manifest.json`.
-- `diffs/`: A split-digest directory with tar-split diffs sufficient to reconstruct an original
-   tar stream.
+- `images/`: Directory of URL encoded hardlinks to `manifest.json` for artifacts
+- `unpacked/`: Directory of URL encoded hardlinks to `manifest.json` for unpacked images
 
 #### "split-digest" format
 

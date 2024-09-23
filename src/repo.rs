@@ -23,7 +23,8 @@ use composefs::fsverity::Digest as VerityDigest;
 use fn_error_context::context;
 use ocidir::cap_std::fs::MetadataExt;
 use ocidir::oci_spec::image::{
-    Descriptor, Digest as DescriptorDigest, DigestAlgorithm, ImageConfiguration, ImageManifest, ImageManifestBuilder, MediaType, Sha256Digest
+    Descriptor, Digest as DescriptorDigest, DigestAlgorithm, ImageConfiguration, ImageManifest,
+    ImageManifestBuilder, MediaType, Sha256Digest,
 };
 use openssl::hash::{Hasher, MessageDigest};
 use rustix::fd::BorrowedFd;
@@ -46,10 +47,9 @@ const OBJECTS: &str = "objects";
 const OBJECTS_BY_SHA256: &str = "objects-by-sha256";
 /// OCI images, may be either packed (or an artifact) or "unpacked"
 const IMAGES: &str = "images";
-/// A subdirectory of images/ with symlinks
-const TAGS: &str = "tags";
+const UNPACKED: &str = "unpacked";
 
-/// The directory with content for a generic OCI image/artifact.
+/// TODO remove this
 const LAYERS: &str = "layers";
 
 /// The directory with metadata for diffs associated with an unpacked
@@ -76,12 +76,10 @@ const ANNOTATION_ROOTFS_VERITY: &str = "containers.composefs.rootfs.digest";
 const XATTR_PREFIX_TRUSTED: &str = "trusted.";
 const XATTR_PREFIX_USER: &str = "user.";
 
-/// fsverity digest of manifest-local-cfs.json
-const XATTR_MANIFEST_TO_LOCAL: &str = "composefs.manifest-local-cfs.fsverity";
-/// fsverity of original manifest.json
-const XATTR_LOCAL_TO_MANIFEST: &str = "composefs.manifest.fsverity";
-/// The extended attribute attached to a directory with the manifest sha256
-const XATTR_MANIFEST_SHA256: &str = "composefs.manifest.digest";
+/// Links imported manifest to original
+const XATTR_MANIFEST_ORIG: &str = "composefs.manifest-original.digest";
+/// The extended attribute with the original descriptor digest.
+const XATTR_DESCRIPTOR_DIGEST: &str = "composefs.descriptor.digest";
 
 const BOOTID_XATTR: &str = "user.cfs-oci.bootid";
 const BY_SHA256_UPLINK: &str = "../../";
@@ -163,13 +161,20 @@ fn object_link_to_digest(buf: Vec<u8>) -> Result<ObjectDigest> {
     Ok(r.digest().into())
 }
 
+fn compare_digests(expected: &str, found: &str) -> Result<()> {
+    if expected != found {
+        anyhow::bail!("Expected digest {expected} but found {found}");
+    }
+    Ok(())
+}
+
 /// Given a tag name (arbitrary string), encode it in a way that is safe for a filename
 /// and prepend the tag directory to it.
 fn tag_path(name: &str) -> Utf8PathBuf {
     assert!(name.len() <= TAG_MAX);
     let tag_filename =
         percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
-    format!("{IMAGES}/{TAGS}/{tag_filename}").into()
+    format!("{IMAGES}/{tag_filename}").into()
 }
 
 /// The extended attribute we attach with the target metadata
@@ -592,21 +597,26 @@ impl RepoTransaction {
         tmpf: DescriptorWriter,
         descriptor: &Descriptor,
     ) -> Result<ObjectDigest> {
+        let expected_sha256 = sha256_of_descriptor(descriptor)?;
         let expected_fsverity = fsverity_of_descriptor(descriptor)?;
         let tmpf = tmpf.finish_validate(&descriptor)?;
+        // Attach the descriptor digest as an xattr so it
+        // can be efficiently looked up.
+        {
+            let full_digest = descriptor.digest().to_string();
+            rustix::fs::fsetxattr(
+                tmpf.as_file().as_fd(),
+                XATTR_DESCRIPTOR_DIGEST,
+                full_digest.as_bytes(),
+                rustix::fs::XattrFlags::empty(),
+            )?;
+        }
         let objid = self.import_object(tmpf)?;
         if let Some(expected_fsverity) = expected_fsverity {
-            if objid != expected_fsverity.digest() {
-                anyhow::bail!(
-                    "Expected fsverity digest {} but found {objid} for descriptor {}",
-                    expected_fsverity.digest(),
-                    descriptor.digest()
-                );
-            }
+            compare_digests(expected_fsverity.digest(), &objid)?;
             // No need to make the by-sha256 link
             return Ok(objid);
         }
-        let expected_sha256 = sha256_of_descriptor(descriptor)?;
         let descriptor_path =
             object_digest_to_path_prefixed(expected_sha256.to_string(), OBJECTS_BY_SHA256);
         let target_path = object_digest_to_path_prefixed(objid.clone(), BY_SHA256_UPLINK);
@@ -704,8 +714,8 @@ impl RepoTransaction {
                 .context(OBJECTS_BY_SHA256)?;
             Self::commit_objects(&from_by_sha256, &to_by_sha256).await?;
         }
-        for name in [IMAGES] {
-            let tags_name = format!("{name}/{TAGS}");
+        for name in [IMAGES, UNPACKED] {
+            let tags_name = format!("{name}/");
             let from_tags = from_basedir
                 .open_dir(&tags_name)
                 .with_context(|| format!("Opening {tags_name}"))?;
@@ -800,12 +810,10 @@ impl Repo {
                 serde_json::to_writer(w, &meta).map_err(anyhow::Error::msg)
             })?;
         }
-        for name in [IMAGES] {
+        for name in [IMAGES, UNPACKED] {
             dir.ensure_dir_with(name, dirbuilder).context(name)?;
-            dir.ensure_dir_with(format!("{name}/{TAGS}"), dirbuilder)
-                .context(TAGS)?;
         }
-        // The overall object dir, and its child by-sha256
+        // We maintain indicies by both fsverity and sha256
         for name in [OBJECTS, OBJECTS_BY_SHA256] {
             dir.ensure_dir_with(name, dirbuilder).context(name)?;
             let objects = dir.open_dir(name)?;
@@ -892,7 +900,32 @@ impl Repo {
             })
     }
 
-    /// Read the complete content of a descriptor 
+    fn read_all_validate_sha256(
+        mut f: impl Read,
+        digest: &Sha256Digest,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        f.read_to_end(buf)?;
+        let mut h = Hasher::new(MessageDigest::sha256())?;
+        h.update(&buf)?;
+        let found_sha256 = hex::encode(h.finish()?);
+        compare_digests(digest.digest(), &found_sha256)?;
+        Ok(())
+    }
+
+    fn read_object_by_digest_all(&self, digest: &Sha256Digest) -> Result<Vec<u8>> {
+        let path = object_digest_to_path_prefixed(digest.digest().into(), OBJECTS_BY_SHA256);
+        let mut f = self.0.dir.open(&path)?;
+        let size = f.metadata()?.size();
+        if size > (METADATA_MAX as u64) {
+            anyhow::bail!("Descriptor size={size} exceeded max={METADATA_MAX}");
+        }
+        let mut buf = Vec::with_capacity(size as usize);
+        Self::read_all_validate_sha256(f, digest, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read the complete content of a descriptor
     #[context("Reading descriptor {}", descriptor.digest())]
     fn read_descriptor_all(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
         // TODO also handle fsverity case
@@ -902,44 +935,53 @@ impl Repo {
         let meta = f.metadata()?;
         let expected_size = descriptor.size();
         let found_size = meta.size();
-        if  expected_size != meta.size() {
+        if expected_size != meta.size() {
             anyhow::bail!("Expected size={expected_size} but found {found_size}");
         }
         if descriptor.size() > (METADATA_MAX as u64) {
             anyhow::bail!("Descriptor size={found_size} exceeded max={METADATA_MAX}");
         }
         let mut r = Vec::with_capacity(found_size as usize);
-        f.read_to_end(&mut r)?;
-        let mut h = Hasher::new(MessageDigest::sha256())?;
-        h.update(&r)?;
-        let found_sha256 = hex::encode(h.finish()?);
-        if found_sha256 != digest {
-            anyhow::bail!("Expected digest={digest} but found {found_sha256}");
-        }
+
         Ok(r)
     }
 
+    fn parse_digest_xattr(f: &File, xattr: &str) -> Result<Sha256Digest> {
+        let digest = fileutils::fgetxattr(&f, xattr, rustix::fs::XattrFlags::empty())?;
+        let digest = String::from_utf8(digest)?;
+        Sha256Digest::from_str(&digest).map_err(Into::into)
+    }
+
     fn image_metadata_from_path(&self, path: &Utf8Path) -> Result<Option<Metadata>> {
-        let Some(dir) = self.0.dir.open_dir_optional(&path)? else {
+        let Some(f) = self.0.dir.open_optional(&path)? else {
             return Ok(None);
         };
-        let manifest = dir.open(MANIFEST_NAME)?;
-        let manifest_meta = manifest.metadata()?;
-        let manifest: ImageManifest = serde_json::from_reader(BufReader::new(manifest))?;
+        let f = f.into_std();
+        let manifest_meta = f.metadata()?;
+        let cfs_manifest: ImageManifest = serde_json::from_reader(BufReader::new(f))?;
 
-        let config = self.read_descriptor_all(manifest.config())?;
+        let config_descriptor = cfs_manifest.config();
+        // TODO read descriptor via fsverity instead
+        let is_native = fsverity_of_descriptor(config_descriptor)?.is_some();
+
+        let (manifest, manifest_digest) = if !is_native {
+            let orig_digest = Self::parse_digest_xattr(&f, XATTR_MANIFEST_ORIG)?;
+            let manifest = self.read_object_by_digest_all(&orig_digest)?;
+            let manifest = serde_json::from_slice(&manifest)?;
+            (manifest, orig_digest)
+        } else {
+            let digest = Self::parse_digest_xattr(&f, XATTR_DESCRIPTOR_DIGEST)?;
+            (cfs_manifest, digest)
+        };
+
+        let config = self.read_descriptor_all(cfs_manifest.config())?;
         let config = serde_json::from_slice(&config)?;
 
-        let mut buf = [0u8; 1024];
-        let n = rustix::fs::fgetxattr(dir.as_fd(), XATTR_MANIFEST_SHA256, &mut buf)?;
-        let buf = &buf[0..n];
-        let buf = str::from_utf8(buf)?;
-        let manifest_digest = Sha256Digest::from_str(buf)?;
         let size = manifest_meta.size();
         let manifest_descriptor = Descriptor::new(MediaType::ImageManifest, size, manifest_digest);
 
         let r = Metadata {
-            manifest,
+            manifest: cfs_manifest,
             config,
             manifest_descriptor,
         };
@@ -1004,10 +1046,6 @@ impl Repo {
         //     return Ok((txn, meta.manifest_descriptor));
         // }
 
-        let tmp = self.0.dir.open_dir(TMP)?;
-        let img_tmpdir = Arc::new(TempDir::new_in(&tmp)?);
-        img_tmpdir.create_dir(LAYERS)?;
-
         let img = proxy.open_image(&imgref).await.context("Opening image")?;
         let (manifest_digest, raw_manifest) = proxy
             .fetch_manifest_raw_oci(&img)
@@ -1020,20 +1058,11 @@ impl Repo {
             raw_manifest.len().try_into().unwrap(),
             manifest_digest,
         );
-        rustix::fs::fsetxattr(
-            img_tmpdir.as_fd(),
-            XATTR_MANIFEST_SHA256,
-            manifest_digest_sha256.as_bytes(),
-            XattrFlags::empty(),
-        )?;
         let manifest_fsverity = {
             let tmpf = txn.new_descriptor_with_bytes(&raw_manifest)?;
             txn.import_descriptor(tmpf, &manifest_descriptor)
                 .context("Importing manifest")?
         };
-
-
-        txn.link_object_at(&manifest_fsverity, img_tmpdir.as_fd(), MANIFEST_NAME)?;
 
         let manifest = ImageManifest::from_reader(io::Cursor::new(&raw_manifest))?;
         let mut augmented_manifest = manifest.clone();
@@ -1079,14 +1108,11 @@ impl Repo {
             let mut sync_blob_reader = tokio_util::io::SyncIoBridge::new(blob_reader);
             // Clone to move into worker thread
             let layer_copy = layer.clone();
-            let tmp2 = Arc::clone(&img_tmpdir);
             let txn2 = Arc::clone(&txn);
-            let layer_name = format!("{LAYERS}/{layer_sha256}");
             let import_task = tokio::task::spawn_blocking(move || -> Result<_> {
                 let mut tmpf = DescriptorWriter::new(txn2.new_object()?)?;
                 let _n: u64 = std::io::copy(&mut sync_blob_reader, &mut tmpf)?;
                 let objid = txn2.import_descriptor(tmpf, &layer_copy)?;
-                txn2.link_object_at(&objid, tmp2.as_fd(), layer_name)?;
                 Ok(objid)
             });
             let (import_task, driver) = tokio::join!(import_task, driver);
@@ -1117,8 +1143,7 @@ impl Repo {
         let starting_with = starting_with.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || -> Result<_> {
             let mut r = Vec::new();
-            let prefix = format!("{IMAGES}/{TAGS}");
-            for e in repo.dir.read_dir(&prefix)? {
+            for e in repo.dir.read_dir(IMAGES)? {
                 let e = e?;
                 let name = e.file_name();
                 let name =
