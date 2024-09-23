@@ -117,10 +117,10 @@ It has the following layout:
 - `meta.json`: Metadata
 - `objects/`: A "split-digest" object directory, used as the shared backing store for all composefs files.
    The digest here is the fsverity digest.
-- `blobs/sha256`: A split-digest object directory with symbolic links to `../../objects`, only used
+- `objects-by-sha256`: A split-digest object directory with symbolic links to `../../objects`, only used
    for images that don't have the annotation `containers.composefs.layer.digest`.
-- `images/`: A directory for OCI images, named by their manifest sha256 digest.
-- `images/tags`: A directory with symbolic links to `images/`, with the file name being a URL encoding of
+- `images/`: A split-digest directory for OCI images, named by their manifest sha256 digest.
+- `images/tags`: A directory with symbolic links to `../` (images), with the file name being a URL encoding of
    the tag.
 
 #### "split-digest" format
